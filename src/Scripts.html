@@ -1,0 +1,868 @@
+<script>
+(function () {
+'use strict';
+
+/* ===================== state & helpers ===================== */
+const S = {
+  boot: null, page: 'dashboard', cats: [], charts: {}, dashDays: 30, dash: null, poll: null, lastOk: 0, refreshing: false,
+  lib: { all: [], q: '', cat: '', sort: 'name', view: 'grid' },
+  data: { q: '', category: '', status: '', from: '', to: '', sort: 'created:desc', page: 1, sel: new Set(), byId: {}, pageIds: [] },
+  an: { range: '30d', from: '', to: '', category: '', status: '', last: null },
+  tasks: { view: 'all', mode: 'list', q: '', priority: '', category: '', byId: {}, counts: null },
+  nr: 'notes', notes: { q: '', category: '', archived: false, byId: {}, counts: null }, rem: { view: 'upcoming', q: '', byId: {}, counts: null },
+  admin: { tab: 'overview', pages: {}, q: {}, sel: {}, audit: { q: '', module: '', page: 1 } }
+};
+const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const PALETTE = ['#6366F1', '#22C55E', '#F59E0B', '#EF4444', '#06B6D4', '#A855F7', '#EC4899', '#84CC16', '#F97316', '#14B8A6'];
+const $ = (s, r) => (r || document).querySelector(s);
+const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+const esc = v => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const uid = () => (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2);
+const ic = (n, c) => '<i data-lucide="' + n + '" class="ic ' + (c || '') + '"></i>';
+let icT;
+function icons() { clearTimeout(icT); icT = setTimeout(() => { if (window.lucide) { try { lucide.createIcons(); } catch (e) { /* ignore */ } } }, 25); }
+function debounce(fn, ms) { let t; return function () { const a = arguments; clearTimeout(t); t = setTimeout(() => fn.apply(null, a), ms); }; }
+function fmtD(s) { if (!s) return '—'; const p = String(s).slice(0, 10).split('-'); return p.length < 3 ? esc(s) : p[2] + ' ' + MON[+p[1] - 1] + ' ' + p[0]; }
+function fmtDT(s) { if (!s) return '—'; return fmtD(s) + (String(s).length > 10 ? ', ' + String(s).slice(11, 16) : ''); }
+function fmtNum(n) { return Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 }); }
+function toLocalTime() { return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
+
+function api(action, payload) {
+  return new Promise((res, rej) => {
+    google.script.run
+      .withSuccessHandler(r => { if (r && r.ok) { markOk(); res(r.data); } else { rej(new Error((r && r.error) || 'Unknown error')); } })
+      .withFailureHandler(e => rej(new Error('Connection problem: ' + ((e && e.message) || e) + '. Please retry.')))
+      .api(action, payload || {});
+  });
+}
+function markOk() { S.lastOk = Date.now(); setSync('ok'); }
+function setSync(state) {
+  const p = $('#syncPill'); if (!p) return;
+  p.classList.toggle('err', state === 'err'); p.classList.toggle('busy', state === 'busy');
+  const txt = state === 'err' ? 'Offline – will retry' : state === 'busy' ? 'Refreshing…' : 'Synced ' + toLocalTime();
+  $('#syncText').textContent = txt; const ss = $('#sideSync'); if (ss) ss.textContent = txt;
+  const sec = S.boot ? Number(S.boot.settings.POLL_INTERVAL_SEC) : 0;
+  p.title = sec > 0 ? 'Auto-refresh about every ' + Math.max(15, sec) + 's (periodic, not instant). Edits made directly in the Google Sheet appear on the next refresh.' : 'Auto-refresh is off. Use the refresh buttons.';
+}
+
+function toast(msg, type) {
+  const el = document.createElement('div'); el.className = 'toast ' + (type || 'info'); el.textContent = msg;
+  $('#toasts').appendChild(el); setTimeout(() => el.classList.add('show'), 10);
+  setTimeout(() => { el.classList.remove('show'); setTimeout(() => el.remove(), 300); }, type === 'error' ? 7000 : 3200);
+}
+function skel(n) { let h = '<div class="skel-grid">'; for (let i = 0; i < (n || 6); i++) h += '<div class="skel"></div>'; return h + '</div>'; }
+function empty(title, text, btn) { return '<div class="empty"><h4>' + esc(title) + '</h4><div>' + esc(text) + '</div>' + (btn || '') + '</div>'; }
+function opts(list, cur, all) { return (all !== undefined ? '<option value="">' + esc(all) + '</option>' : '') + list.map(o => '<option' + (o === cur ? ' selected' : '') + '>' + esc(o) + '</option>').join(''); }
+function setCats(list) { S.cats = list || S.cats; $('#dl-cat').innerHTML = S.cats.map(c => '<option value="' + esc(c) + '">').join(''); }
+function badge(t, k) { return '<span class="bd ' + (k || '') + '">' + esc(t) + '</span>'; }
+function priBadge(p) { return badge(p, p === 'High' ? 'bad' : p === 'Low' ? 'mut' : 'warn'); }
+function statusBadge(s) { const m = { Active: 'ok', Pending: 'warn', Completed: 'ok', 'In Progress': '', 'To Do': 'mut', 'On Hold': 'warn', Archived: 'mut', Sent: 'ok' }; return badge(s, m[s] === undefined ? '' : m[s]); }
+function copyText(t) {
+  const done = () => toast('Copied to clipboard', 'success');
+  const fb = () => { const a = document.createElement('textarea'); a.value = t; a.style.position = 'fixed'; a.style.opacity = '0'; document.body.appendChild(a); a.select(); try { document.execCommand('copy'); done(); } catch (e) { toast('Copy failed – select and copy manually.', 'error'); } a.remove(); };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(done, fb); else fb();
+}
+function download(name, text, mime) {
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: mime || 'text/plain' })); a.download = name;
+  document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+}
+
+/* ===================== modal / forms ===================== */
+function openModal(o) {
+  const wrap = document.createElement('div'); wrap.className = 'modal-back';
+  wrap.innerHTML = '<div class="modal' + (o.wide ? ' wide' : '') + '" role="dialog" aria-modal="true"><div class="modal-h"><h3>' + esc(o.title) + '</h3><button class="icon-btn" data-close aria-label="Close">' + ic('x') + '</button></div><div class="modal-b">' + o.html + '</div></div>';
+  $('#modal-root').appendChild(wrap); document.body.classList.add('modal-open');
+  const close = () => { if (!wrap.isConnected) return; wrap.remove(); if (!$('.modal-back')) document.body.classList.remove('modal-open'); if (o.onClose) o.onClose(); };
+  wrap.addEventListener('mousedown', e => { if (e.target === wrap) close(); });
+  $('[data-close]', wrap).onclick = close;
+  icons(); if (o.onMount) o.onMount(wrap, close);
+  return { el: wrap, close };
+}
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { const m = $$('.modal-back'); if (m.length) { const last = m[m.length - 1]; const b = $('[data-close]', last); if (b) b.click(); } closeSearch(); }
+});
+
+function confirmBox(title, msg, o) {
+  o = o || {};
+  return new Promise(res => {
+    let ans = false;
+    openModal({
+      title, onClose: () => res(ans),
+      html: '<p class="muted-p">' + esc(msg) + '</p>' + (o.typed ? '<input class="inp" id="cf-t" placeholder="Type ' + esc(o.typed) + ' to confirm" autocomplete="off">' : '') +
+        '<div class="modal-f"><button class="btn ghost" data-no>Cancel</button><button class="btn ' + (o.danger ? 'danger' : 'primary') + '" data-yes' + (o.typed ? ' disabled' : '') + '>' + esc(o.ok || 'Confirm') + '</button></div>',
+      onMount: (el, close) => {
+        const yes = $('[data-yes]', el);
+        if (o.typed) $('#cf-t', el).addEventListener('input', e => { yes.disabled = e.target.value.trim() !== o.typed; });
+        $('[data-no]', el).onclick = close;
+        yes.onclick = () => { ans = o.typed ? $('#cf-t', el).value.trim() : true; close(); };
+      }
+    });
+  });
+}
+
+function fieldHtml(f, v) {
+  const id = 'f-' + f.name, val = v == null ? '' : v;
+  let inp;
+  if (f.type === 'textarea') inp = '<textarea class="inp" id="' + id + '" name="' + f.name + '" rows="' + (f.rows || 3) + '" maxlength="' + (f.max || 2000) + '" placeholder="' + esc(f.ph || '') + '">' + esc(val) + '</textarea>';
+  else if (f.type === 'select') inp = '<select class="inp" id="' + id + '" name="' + f.name + '">' + f.options.map(o => '<option' + (o === val ? ' selected' : '') + '>' + esc(o) + '</option>').join('') + '</select>';
+  else if (f.type === 'checkbox') inp = '<label class="chk"><input type="checkbox" name="' + f.name + '"' + (val ? ' checked' : '') + '> ' + esc(f.text || '') + '</label>';
+  else if (f.type === 'cat') inp = '<input class="inp" id="' + id + '" name="' + f.name + '" list="dl-cat" maxlength="60" value="' + esc(val) + '" placeholder="Pick or type a new category">';
+  else inp = '<input class="inp" id="' + id + '" name="' + f.name + '" type="' + (f.type || 'text') + '"' + (f.step ? ' step="' + f.step + '"' : '') + ' maxlength="' + (f.max || 200) + '" value="' + esc(val) + '" placeholder="' + esc(f.ph || '') + '"' + (f.type === 'number' ? ' inputmode="decimal"' : '') + '>';
+  return '<div class="fld' + (f.full ? ' full' : '') + '">' + (f.label ? '<label for="' + id + '">' + esc(f.label) + (f.req ? ' <b class="req">*</b>' : '') + '</label>' : '') + inp + '</div>';
+}
+function openForm(o) {
+  return openModal({
+    title: o.title, wide: o.wide,
+    html: (o.intro ? '<p class="muted-p">' + o.intro + '</p>' : '') + '<form id="mf" novalidate><div class="fgrid">' + o.fields.map(f => fieldHtml(f, (o.values || {})[f.name])).join('') +
+      '</div><div class="ferr" id="mf-err" role="alert"></div><div class="modal-f"><button type="button" class="btn ghost" data-cancel>Cancel</button><button type="submit" class="btn primary" id="mf-ok">' + esc(o.submit || 'Save') + '</button></div></form>',
+    onMount: (el, close) => {
+      const form = $('#mf', el); let rid = uid();
+      $('[data-cancel]', el).onclick = close;
+      form.onsubmit = async e => {
+        e.preventDefault();
+        const vals = {};
+        o.fields.forEach(f => { const n = form.elements[f.name]; vals[f.name] = f.type === 'checkbox' ? n.checked : n.value; });
+        for (const f of o.fields) { if (f.req && !String(vals[f.name]).trim()) { $('#mf-err', el).textContent = (f.label || f.name) + ' is required.'; return; } }
+        vals.requestId = rid;
+        const btn = $('#mf-ok', el); btn.disabled = true; btn.textContent = 'Saving…'; $('#mf-err', el).textContent = '';
+        try { await o.onSubmit(vals); close(); }
+        catch (err) { $('#mf-err', el).textContent = err.message; rid = uid(); btn.disabled = false; btn.textContent = o.submit || 'Save'; }
+      };
+      const first = form.querySelector('input:not([type=checkbox]),textarea,select'); if (first) first.focus();
+    }
+  });
+}
+
+/* ===================== events (delegated) ===================== */
+const ACT = {}, CHG = {}, INP = {};
+document.addEventListener('click', e => { const t = e.target.closest('[data-act]'); if (!t) { if (!e.target.closest('.gsearch')) closeSearch(); return; } const f = ACT[t.dataset.act]; if (f) { e.preventDefault(); f(t, e); } });
+document.addEventListener('change', e => { const t = e.target.closest('[data-chg]'); if (t && CHG[t.dataset.chg]) CHG[t.dataset.chg](t, e); });
+document.addEventListener('input', e => { const t = e.target.closest('[data-inp]'); if (t && INP[t.dataset.inp]) INP[t.dataset.inp](t, e); });
+document.addEventListener('submit', async e => {
+  const f = e.target.closest('[data-form]'); if (!f) return; e.preventDefault();
+  if (f.dataset.form.indexOf('settings-') === 0) saveSettingsForm(f);
+});
+
+/* ===================== router ===================== */
+const LOADERS = {};
+function load(page, silent) {
+  const f = LOADERS[page];
+  if (!f) return Promise.resolve();
+  if (silent) setSync('busy');
+  return f(!!silent).catch(e => { if (!silent) toast(e.message, 'error'); setSync('err'); });
+}
+function go(page) {
+  S.page = page;
+  $$('.page').forEach(p => { p.hidden = p.id !== 'page-' + page; });
+  $$('[data-page]').forEach(a => a.classList.toggle('active', a.dataset.page === page));
+  try { localStorage.setItem('ms-page', page); } catch (e) { /* ignore */ }
+  window.scrollTo(0, 0);
+  return load(page, false);
+}
+function afterWrite() { refreshBell(); return load(S.page, true); }
+ACT.nav = t => { go(t.dataset.page); };
+ACT['toggle-side'] = () => { $('#sidebar').classList.toggle('collapsed'); };
+ACT.more = () => {
+  const m = openModal({ title: 'More', html: '<div class="grid3">' + [['analytics', 'bar-chart-3', 'Analytics'], ['notes', 'sticky-note', 'Notes & Reminders'], ['admin', 'shield-check', 'Admin Panel'], ['settings', 'settings', 'Settings']].map(x => '<button class="btn" data-go="' + x[0] + '">' + ic(x[1]) + ' ' + x[2] + '</button>').join('') + '</div>',
+    onMount: (el, close) => { $$('[data-go]', el).forEach(b => { b.onclick = () => { close(); go(b.dataset.go); }; }); } });
+};
+
+/* ===================== theme / topbar ===================== */
+function applyTheme(t) {
+  document.documentElement.className = 'theme-' + t;
+  try { localStorage.setItem('ms-theme', t); } catch (e) { /* ignore */ }
+  const b = $('[data-act="theme"]'); if (b) { b.innerHTML = ic(t === 'dark' ? 'sun' : 'moon'); icons(); }
+}
+ACT.theme = () => { applyTheme(document.documentElement.classList.contains('theme-dark') ? 'light' : 'dark'); if (S.page !== 'settings') load(S.page, true); };
+ACT.profile = () => {
+  openModal({ title: 'Your account', html: '<p><b>' + esc(S.boot.user) + '</b></p><p class="muted-p">Access is restricted to this Google account. Every request is verified on the server.</p><p class="muted-s">Time zone: ' + esc(S.boot.tz) + '</p>' +
+    '<div class="modal-f"><a class="btn" href="' + esc(S.boot.spreadsheetUrl) + '" target="_blank" rel="noopener">' + ic('external-link') + ' Open database spreadsheet</a></div>' });
+};
+async function refreshBell() {
+  try {
+    const n = await api('notifications'); S.boot.today = n.today; S.notif = n;
+    const tot = n.overdueTasks + n.overdueReminders, b = $('#bellBadge'); b.hidden = tot === 0; b.textContent = tot > 99 ? '99+' : tot;
+  } catch (e) { /* silent */ }
+}
+ACT.bell = async () => {
+  await refreshBell(); const n = S.notif || { tasks: [], reminders: [] };
+  const li = (type, id, title, sub) => '<li data-act="open-item" data-type="' + type + '" data-id="' + esc(id) + '"><div class="t"><b>' + esc(title) + '</b><small>' + esc(sub) + '</small></div></li>';
+  const body = (n.tasks.length ? '<h4 style="margin:4px 0 6px">Overdue tasks (' + n.overdueTasks + ')</h4><ul class="li">' + n.tasks.map(t => li('task', t.id, t.taskName, 'Due ' + fmtD(t.dueDate))).join('') + '</ul>' : '') +
+    (n.reminders.length ? '<h4 style="margin:14px 0 6px">Overdue reminders (' + n.overdueReminders + ')</h4><ul class="li">' + n.reminders.map(r => li('reminder', r.id, r.reminderTitle, fmtD(r.reminderDate) + ' ' + r.reminderTime)).join('') + '</ul>' : '');
+  openModal({ title: 'Notifications', html: body || '<div class="empty-sm">You are all caught up. Nothing is overdue.</div>' });
+};
+ACT['quick-add'] = () => {
+  const items = [['data', 'database', 'New Data Entry'], ['sheet', 'file-spreadsheet', 'New Sheet Link'], ['task', 'check-square', 'New Task'], ['note', 'sticky-note', 'New Note'], ['reminder', 'clock', 'New Reminder']];
+  openModal({ title: 'Quick Add', html: '<div class="grid3">' + items.map(x => '<button class="btn" data-qa="' + x[0] + '">' + ic(x[1]) + ' ' + x[2] + '</button>').join('') + '</div>',
+    onMount: (el, close) => { $$('[data-qa]', el).forEach(b => { b.onclick = () => { close(); quickAction(b.dataset.qa); }; }); } });
+};
+function quickAction(k) { ({ data: addRecord, sheet: addSheet, task: addTask, note: addNote, reminder: addReminder })[k](); }
+
+/* global search */
+function closeSearch() { const r = $('#gsearch-res'); if (r) r.hidden = true; }
+INP.gsearch = debounce(async el => {
+  const q = el.value.trim(), box = $('#gsearch-res');
+  if (q.length < 2) { box.hidden = true; return; }
+  try {
+    const r = await api('search', { q });
+    box.innerHTML = r.results.length ? r.results.map(x => '<div class="sr" data-act="open-item" data-type="' + x.type + '" data-id="' + esc(x.id) + '"><b>' + esc(x.title) + '</b><small>' + esc(x.sub) + '</small></div>').join('') : '<div class="empty-sm">No results for "' + esc(q) + '"</div>';
+    box.hidden = false;
+  } catch (e) { toast(e.message, 'error'); }
+}, 350);
+ACT['open-item'] = async t => {
+  const type = t.dataset.type, id = t.dataset.id; closeSearch();
+  $$('.modal-back').forEach(m => { const b = $('[data-close]', m); if (b) b.click(); });
+  try {
+    const it = await api('item', { type, id });
+    if (type === 'sheet') { await go('library'); editSheet(it); }
+    else if (type === 'data') { await go('data'); editRecord(it); }
+    else if (type === 'task') { await go('tasks'); editTask(it); }
+    else if (type === 'note') { S.nr = 'notes'; await go('notes'); editNote(it); }
+    else if (type === 'reminder') { S.nr = 'reminders'; await go('notes'); editReminder(it); }
+  } catch (e) { toast(e.message, 'error'); }
+};
+
+/* ===================== charts ===================== */
+const bgPlugin = { id: 'bg', beforeDraw(c) { const x = c.canvas.getContext('2d'); x.save(); x.globalCompositeOperation = 'destination-over'; x.fillStyle = getComputedStyle(document.body).getPropertyValue('--card').trim() || '#fff'; x.fillRect(0, 0, c.width, c.height); x.restore(); } };
+function killChart(id) { if (S.charts[id]) { S.charts[id].destroy(); delete S.charts[id]; } }
+function mkChart(id, type, labels, datasets, o) {
+  o = o || {};
+  const box = document.getElementById('box-' + id); if (!box) return;
+  const total = datasets.reduce((a, d) => a + d.data.reduce((x, y) => x + y, 0), 0);
+  killChart(id);
+  if (!window.Chart) { box.innerHTML = '<div class="empty-sm">Chart library could not load. Check your internet connection.</div>'; return; }
+  if (!total) { box.innerHTML = '<div class="empty-sm" style="padding-top:90px">No data in this range yet.</div>'; return; }
+  box.innerHTML = '<canvas id="' + id + '"></canvas>';
+  const css = getComputedStyle(document.documentElement), muted = css.getPropertyValue('--muted').trim(), grid = css.getPropertyValue('--border').trim();
+  const round = type === 'doughnut' || type === 'pie';
+  S.charts[id] = new Chart(document.getElementById(id), {
+    type, data: { labels, datasets }, plugins: [bgPlugin],
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: o.legend !== false, position: round ? 'bottom' : 'top', labels: { color: muted, boxWidth: 12 } }, tooltip: { enabled: true } },
+      scales: round ? {} : { x: { ticks: { color: muted, maxRotation: 0, autoSkip: true, maxTicksLimit: 8 }, grid: { display: false } }, y: { beginAtZero: true, ticks: { color: muted, precision: 0 }, grid: { color: grid } } }
+    }
+  });
+}
+function ds(label, data, i, fill) { const c = PALETTE[i % PALETTE.length]; return { label, data, borderColor: c, backgroundColor: fill ? c + '33' : c, fill: !!fill, tension: .3, borderRadius: 6, pointRadius: 2 }; }
+function pie(label, data) { return [{ label, data, backgroundColor: data.map((_, i) => PALETTE[i % PALETTE.length]), borderWidth: 0 }]; }
+function shortDay(s) { return s.slice(8) + ' ' + MON[+s.slice(5, 7) - 1]; }
+ACT.png = t => { const c = S.charts[t.dataset.id]; if (!c) { toast('Nothing to export for this chart.', 'error'); return; } const a = document.createElement('a'); a.href = c.toBase64Image('image/png', 1); a.download = t.dataset.id + '.png'; a.click(); };
+
+/* ===================== DASHBOARD ===================== */
+const WIDGETS = [['kpis', 'KPI cards'], ['quick', 'Quick actions'], ['favorites', 'Favorite sheets'], ['entries', 'Recent data entries'], ['tasks', "Today's tasks"], ['reminders', 'Upcoming reminders'], ['notes', 'Recent notes'], ['activity', 'Latest activity'], ['charts', 'Charts']];
+function widgetsOn() { return String(S.boot.settings.DASH_WIDGETS || '').split(',').map(s => s.trim()).filter(Boolean); }
+LOADERS.dashboard = async function (silent, force) {
+  const box = $('#page-dashboard');
+  if (!silent && !box.dataset.ready) box.innerHTML = skel(8);
+  const d = await api('dashboard', { days: S.dashDays, force: !!force });
+  S.dash = d; S.boot.today = d.today; renderDashboard(d); box.dataset.ready = 1;
+};
+function liItem(type, id, title, sub, right) { return '<li data-act="open-item" data-type="' + type + '" data-id="' + esc(id) + '"><div class="t"><b>' + esc(title) + '</b><small>' + sub + '</small></div>' + (right || '') + '</li>'; }
+function listOr(arr, fn, msg) { return arr.length ? '<ul class="li">' + arr.map(fn).join('') + '</ul>' : '<div class="empty-sm">' + msg + '</div>'; }
+function renderDashboard(d) {
+  const W = widgetsOn(), k = d.kpis; let h = '';
+  h += '<div class="page-h"><div><h1>Dashboard</h1><p>' + fmtD(d.today) + ' · calculated from your Google Sheet</p></div><div class="row">' +
+    '<select class="inp" data-chg="dash-days" style="width:auto" aria-label="Chart range">' + [7, 30, 90].map(n => '<option value="' + n + '"' + (n === S.dashDays ? ' selected' : '') + '>Last ' + n + ' days</option>').join('') + '</select>' +
+    '<button class="btn" data-act="dash-widgets">' + ic('sliders-horizontal') + ' Customize</button><button class="btn primary" data-act="dash-refresh">' + ic('refresh-cw') + ' Refresh</button></div></div>';
+  if (k.overdueTasks) h += '<div class="alert warn">' + ic('alert-triangle') + '<div style="flex:1"><b>' + k.overdueTasks + ' overdue task' + (k.overdueTasks > 1 ? 's' : '') + '</b> – ' + d.overdueTasks.slice(0, 3).map(t => esc(t.taskName)).join(', ') + (k.overdueTasks > 3 ? '…' : '') + '</div><button class="btn sm" data-act="go-overdue">View</button></div>';
+  if (W.indexOf('kpis') >= 0) {
+    const K = [['Total Important Sheets', k.totalSheets, 'file-spreadsheet', '', 'library'], ['Favorite Sheets', k.favoriteSheets, 'star', 'warn', 'library'], ['Total Data Records', k.totalRecords, 'database', '', 'data'], ['Records Added Today', k.recordsToday, 'plus-circle', 'ok', 'data'],
+      ['Pending Tasks', k.pendingTasks, 'clock', 'warn', 'tasks'], ['Completed Tasks', k.completedTasks, 'check-circle-2', 'ok', 'tasks'], ['Overdue Tasks', k.overdueTasks, 'alert-triangle', 'bad', 'tasks'], ['Active Reminders', k.activeReminders, 'bell-ring', '', 'notes']];
+    h += '<div class="kpis">' + K.map(x => '<div class="kpi ' + x[3] + '" data-act="nav" data-page="' + x[4] + '"><div class="k-ic">' + ic(x[2]) + '</div><b>' + x[1] + '</b><span>' + x[0] + '</span></div>').join('') + '</div>';
+  }
+  if (W.indexOf('quick') >= 0) h += '<div class="card section-gap"><h3>Quick actions</h3><div class="row">' +
+    [['data', 'plus', 'Add New Record'], ['sheet', 'file-plus', 'Add Google Sheet Link'], ['task', 'check-square', 'Create Task'], ['note', 'sticky-note', 'Add Note'], ['reminder', 'bell-plus', 'Set Reminder']].map(x => '<button class="btn" data-act="qa" data-k="' + x[0] + '">' + ic(x[1]) + ' ' + x[2] + '</button>').join('') +
+    '<button class="btn" data-act="dash-refresh">' + ic('refresh-cw') + ' Refresh Dashboard</button></div></div>';
+  const cards = [];
+  if (W.indexOf('favorites') >= 0) cards.push('<div class="card"><h3>Favorite sheets <a href="#" data-act="nav" data-page="library" class="muted-s">View all</a></h3>' +
+    listOr(d.favorites, s => '<li data-act="dash-open-sheet" data-id="' + esc(s.id) + '"><div class="t"><b>' + (s.pinned ? '📌 ' : '') + esc(s.name) + '</b><small>' + esc(s.category) + '</small></div>' + ic('external-link') + '</li>', 'Star a sheet in My Sheets to see it here.') + '</div>');
+  if (W.indexOf('entries') >= 0) cards.push('<div class="card"><h3>Recent data entries <a href="#" data-act="nav" data-page="data" class="muted-s">View all</a></h3>' +
+    listOr(d.recentEntries, r => liItem('data', r.id, r.title, esc(r.category) + ' · ' + fmtD(r.entryDate), r.valueAmount === '' ? '' : '<span class="bd">' + fmtNum(r.valueAmount) + '</span>'), 'No records yet.') + '</div>');
+  if (W.indexOf('tasks') >= 0) cards.push('<div class="card"><h3>Today\'s tasks <a href="#" data-act="nav" data-page="tasks" class="muted-s">View all</a></h3>' +
+    listOr(d.todayTasks, t => liItem('task', t.id, t.taskName, esc(t.category) + (t.dueDate ? ' · due ' + fmtD(t.dueDate) : ''), priBadge(t.priority)), 'Nothing scheduled for today.') + '</div>');
+  if (W.indexOf('reminders') >= 0) cards.push('<div class="card"><h3>Upcoming reminders</h3>' +
+    listOr(d.upcomingReminders, r => liItem('reminder', r.id, r.reminderTitle, fmtD(r.reminderDate) + ' ' + esc(r.reminderTime) + (r.repeatRule !== 'None' ? ' · ' + esc(r.repeatRule) : ''), r.overdue ? badge('Due', 'bad') : ''), 'No active reminders.') + '</div>');
+  if (W.indexOf('notes') >= 0) cards.push('<div class="card"><h3>Recent notes</h3>' + listOr(d.recentNotes, n => liItem('note', n.id, n.title, esc(n.content.slice(0, 70))), 'No notes yet.') + '</div>');
+  if (W.indexOf('activity') >= 0) cards.push('<div class="card"><h3>Latest activity</h3>' + listOr(d.activity, a => '<li style="cursor:default"><div class="t"><b>' + esc(a.action) + '</b><small>' + esc(a.module) + ' · ' + fmtDT(a.timestamp) + '</small></div></li>', 'No activity logged yet.') + '</div>');
+  if (cards.length) h += '<div class="grid2 section-gap">' + cards.join('') + '</div>';
+  if (W.indexOf('charts') >= 0) h += '<div class="grid2"><div class="card chart-card"><h3>Records added – last ' + d.days + ' days</h3><div class="chart-box" id="box-d-daily"></div></div><div class="card chart-card"><h3>Records by status</h3><div class="chart-box" id="box-d-status"></div></div></div>';
+  if (!W.length) h += empty('All widgets are hidden', 'Use Customize to choose what appears on your dashboard.');
+  $('#page-dashboard').innerHTML = h; icons();
+  if (W.indexOf('charts') >= 0) {
+    mkChart('d-daily', 'line', d.daily.labels.map(shortDay), [ds('Records', d.daily.values, 0, true)], { legend: false });
+    mkChart('d-status', 'doughnut', d.status.labels, pie('Records', d.status.values));
+  }
+}
+CHG['dash-days'] = t => { S.dashDays = +t.value; load('dashboard', true); };
+ACT['dash-refresh'] = () => { setSync('busy'); LOADERS.dashboard(true, true).then(() => toast('Dashboard refreshed', 'success')).catch(e => toast(e.message, 'error')); };
+ACT['go-overdue'] = () => { S.tasks.view = 'overdue'; const b = $('#page-tasks'); if (b) b.dataset.ready = ''; go('tasks'); };
+ACT.qa = t => { if (t.dataset.k === 'refresh') ACT['dash-refresh'](); else quickAction(t.dataset.k); };
+ACT['dash-open-sheet'] = t => { const s = (S.dash.favorites || []).filter(x => x.id === t.dataset.id)[0]; if (s) openSheet(s); };
+ACT['dash-widgets'] = () => {
+  const on = widgetsOn();
+  openModal({ title: 'Customize dashboard', html: '<p class="muted-p">Choose which widgets appear. Saved to your account settings.</p>' + WIDGETS.map(w => '<label class="chk" style="padding:6px 0"><input type="checkbox" value="' + w[0] + '"' + (on.indexOf(w[0]) >= 0 ? ' checked' : '') + '> ' + w[1] + '</label>').join('') + '<div class="modal-f"><button class="btn primary" id="wsave">Save</button></div>',
+    onMount: (el, close) => { $('#wsave', el).onclick = async () => { const v = $$('input:checked', el).map(i => i.value).join(','); try { const r = await api('settings.save', { values: { DASH_WIDGETS: v || 'none' } }); S.boot.settings = r.settings; close(); load('dashboard', true); } catch (e) { toast(e.message, 'error'); } }; } });
+};
+
+/* ===================== MY SHEETS ===================== */
+function sheetFields() {
+  return [
+    { name: 'name', label: 'Sheet name', req: true, full: true, max: 120 },
+    { name: 'url', label: 'Google Sheets URL', type: 'url', req: true, full: true, max: 500, ph: 'https://docs.google.com/spreadsheets/d/…' },
+    { name: 'category', label: 'Category', type: 'cat' },
+    { name: 'priority', label: 'Priority', type: 'select', options: S.boot.lists.priority },
+    { name: 'tags', label: 'Tags (comma separated)', full: true },
+    { name: 'description', label: 'Description', type: 'textarea', full: true },
+    { name: 'favorite', type: 'checkbox', text: 'Favorite (show on dashboard)' },
+    { name: 'pinned', type: 'checkbox', text: 'Pin to top' }
+  ];
+}
+const SHEET_INTRO = 'Only the link is saved – the spreadsheet\'s contents are not imported. Private spreadsheets still require you to be signed in with access when you open them.';
+function addSheet() { openForm({ title: 'Add Google Sheet link', intro: SHEET_INTRO, fields: sheetFields(), values: { category: 'Other', priority: 'Medium' }, submit: 'Add sheet', onSubmit: async v => { await api('library.add', v); toast('Sheet link added', 'success'); afterWrite(); } }); }
+function editSheet(s) { openForm({ title: 'Edit sheet details', fields: sheetFields(), values: s, submit: 'Save changes', onSubmit: async v => { v.id = s.id; await api('library.update', v); toast('Sheet updated', 'success'); afterWrite(); } }); }
+function openSheet(s) {
+  window.open(s.url, '_blank', 'noopener');
+  api('library.opened', { id: s.id }).then(() => { if (S.page === 'library') load('library', true); }).catch(() => { });
+}
+LOADERS.library = async function (silent) {
+  const b = $('#page-library');
+  if (!b.dataset.ready) {
+    b.innerHTML = '<div class="page-h"><div><h1>My Sheets</h1><p>Your library of important Google Sheets</p></div><button class="btn primary" data-act="lib-add">' + ic('plus') + ' Add Sheet</button></div>' +
+      '<div class="toolbar"><input class="inp grow" data-inp="lib-q" type="search" placeholder="Search by name, tag, description…" aria-label="Search sheets"><select class="inp" id="lib-cat" data-chg="lib-cat" aria-label="Category"></select>' +
+      '<select class="inp" data-chg="lib-sort" aria-label="Sort"><option value="name">Sort: Name</option><option value="date">Sort: Date added</option><option value="priority">Sort: Priority</option><option value="opened">Sort: Recently opened</option></select>' +
+      '<div class="seg"><button data-act="lib-view" data-v="grid" class="on">' + ic('layout-grid') + '</button><button data-act="lib-view" data-v="list">' + ic('list') + '</button></div></div><div id="lib-recent"></div><div id="lib-list"></div>';
+    b.dataset.ready = 1; icons();
+  }
+  if (!silent) $('#lib-list').innerHTML = skel(6);
+  const r = await api('library.list'); S.lib.all = r.sheets; setCats(r.categories);
+  const sel = $('#lib-cat'); sel.innerHTML = opts(S.cats, S.lib.cat, 'All categories');
+  renderLibrary();
+};
+function renderLibrary() {
+  const L = S.lib, q = L.q.toLowerCase();
+  let rows = L.all.filter(s => (!L.cat || s.category === L.cat) && (!q || (s.name + ' ' + s.description + ' ' + s.tags + ' ' + s.category + ' ' + s.url).toLowerCase().indexOf(q) >= 0));
+  const pr = { High: 0, Medium: 1, Low: 2 };
+  rows.sort((a, b) => (b.pinned - a.pinned) || (L.sort === 'date' ? String(b.dateAdded).localeCompare(a.dateAdded) : L.sort === 'priority' ? (pr[a.priority] - pr[b.priority]) || a.name.localeCompare(b.name) : L.sort === 'opened' ? String(b.lastOpened).localeCompare(a.lastOpened) : a.name.localeCompare(b.name)));
+  const recent = L.all.filter(s => s.lastOpened).sort((a, b) => b.lastOpened.localeCompare(a.lastOpened)).slice(0, 5);
+  $('#lib-recent').innerHTML = (!q && !L.cat && recent.length) ? '<div class="card" style="margin-bottom:14px"><h3>Recently opened</h3><div class="chips">' + recent.map(s => '<button class="btn sm" data-act="lib-open" data-id="' + esc(s.id) + '">' + ic('file-spreadsheet') + ' ' + esc(s.name) + '</button>').join('') + '</div></div>' : '';
+  $('#lib-list').innerHTML = rows.length ? '<div class="grid3' + (L.view === 'list' ? ' list-view' : '') + '">' + rows.map(sheetCard).join('') + '</div>' :
+    empty(L.all.length ? 'No sheets match your filters' : 'No sheets yet', L.all.length ? 'Try clearing the search or category filter.' : 'Add the link of an important Google Sheet to build your library.', L.all.length ? '' : '<br><button class="btn primary" data-act="lib-add">' + ic('plus') + ' Add your first sheet</button>');
+  $$('[data-act="lib-view"]').forEach(b => b.classList.toggle('on', b.dataset.v === L.view));
+  icons();
+}
+function sheetCard(s) {
+  return '<div class="card sheet-card"><div class="sc-top"><div class="sc-ic">' + ic('file-spreadsheet') + '</div><div class="sc-t"><b>' + esc(s.name) + '</b><small>' + esc(s.category) + '</small></div>' + priBadge(s.priority) + '</div>' +
+    (s.description ? '<p>' + esc(s.description) + '</p>' : '') + (s.tags ? '<div class="chips">' + s.tags.split(',').map(t => '<span class="tag">' + esc(t.trim()) + '</span>').join('') + '</div>' : '') +
+    '<small class="muted">' + (s.lastOpened ? 'Opened ' + fmtDT(s.lastOpened) : 'Never opened') + '</small>' +
+    '<div class="sc-act"><button class="btn sm primary" data-act="lib-open" data-id="' + esc(s.id) + '">' + ic('external-link') + ' Open</button>' +
+    '<button class="icon-btn sm" title="Copy URL" data-act="lib-copy" data-id="' + esc(s.id) + '">' + ic('copy') + '</button>' +
+    '<button class="icon-btn sm ' + (s.favorite ? 'on' : '') + '" title="Favorite" data-act="lib-fav" data-id="' + esc(s.id) + '">' + ic('star') + '</button>' +
+    '<button class="icon-btn sm ' + (s.pinned ? 'on' : '') + '" title="Pin" data-act="lib-pin" data-id="' + esc(s.id) + '">' + ic('pin') + '</button>' +
+    '<button class="icon-btn sm" title="Edit" data-act="lib-edit" data-id="' + esc(s.id) + '">' + ic('pencil') + '</button>' +
+    '<button class="icon-btn sm" title="Delete" data-act="lib-del" data-id="' + esc(s.id) + '">' + ic('trash-2') + '</button></div></div>';
+}
+const libById = id => S.lib.all.filter(s => s.id === id)[0];
+INP['lib-q'] = debounce(el => { S.lib.q = el.value; renderLibrary(); }, 200);
+CHG['lib-cat'] = t => { S.lib.cat = t.value; renderLibrary(); };
+CHG['lib-sort'] = t => { S.lib.sort = t.value; renderLibrary(); };
+ACT['lib-view'] = t => { S.lib.view = t.dataset.v; renderLibrary(); };
+ACT['lib-add'] = addSheet;
+ACT['lib-open'] = t => { const s = libById(t.dataset.id); if (s) openSheet(s); };
+ACT['lib-copy'] = t => { const s = libById(t.dataset.id); if (s) copyText(s.url); };
+ACT['lib-edit'] = t => { const s = libById(t.dataset.id); if (s) editSheet(s); };
+ACT['lib-fav'] = async t => { try { await api('library.fav', { id: t.dataset.id }); afterWrite(); } catch (e) { toast(e.message, 'error'); } };
+ACT['lib-pin'] = async t => { try { await api('library.pin', { id: t.dataset.id }); afterWrite(); } catch (e) { toast(e.message, 'error'); } };
+ACT['lib-del'] = async t => {
+  const s = libById(t.dataset.id); if (!s) return;
+  if (!await confirmBox('Delete sheet link?', '"' + s.name + '" will be removed from your library. The Google Sheet itself is not touched.', { danger: true, ok: 'Delete' })) return;
+  try { await api('library.delete', { id: s.id, confirm: true }); toast('Sheet link deleted', 'success'); afterWrite(); } catch (e) { toast(e.message, 'error'); }
+};
+
+/* ===================== DATA ENTRY ===================== */
+function recFields() {
+  return [
+    { name: 'entryDate', label: 'Entry date', type: 'date', req: true },
+    { name: 'category', label: 'Category', type: 'cat', req: true },
+    { name: 'title', label: 'Title', req: true, full: true },
+    { name: 'valueAmount', label: 'Value / Amount', type: 'number', step: 'any' },
+    { name: 'status', label: 'Status', type: 'select', options: S.boot.lists.dataStatus },
+    { name: 'priority', label: 'Priority', type: 'select', options: S.boot.lists.priority },
+    { name: 'description', label: 'Description', type: 'textarea', full: true },
+    { name: 'remarks', label: 'Remarks', type: 'textarea', full: true, rows: 2, max: 1000 }
+  ];
+}
+function addRecord() { openForm({ title: 'Add record', fields: recFields(), values: { entryDate: S.boot.today, category: S.cats[0] || 'Other', status: 'Active', priority: 'Medium' }, submit: 'Add record', onSubmit: async v => { await api('data.add', v); toast('Record saved to Google Sheets', 'success'); afterWrite(); } }); }
+function editRecord(r) { openForm({ title: 'Edit record', fields: recFields(), values: r, submit: 'Save changes', onSubmit: async v => { v.id = r.id; await api('data.update', v); toast('Record updated', 'success'); afterWrite(); } }); }
+LOADERS.data = async function (silent) {
+  const b = $('#page-data');
+  if (!b.dataset.ready) {
+    b.innerHTML = '<div class="page-h"><div><h1>Data Entry</h1><p>Records you add here are saved straight into your Google Sheet</p></div><div class="row"><button class="btn" data-act="csv-import">' + ic('upload') + ' Import CSV</button><button class="btn" data-act="csv-export">' + ic('download') + ' Export CSV</button><button class="btn primary" data-act="rec-add">' + ic('plus') + ' Add Record</button></div></div>' +
+      '<input type="file" id="csvFile" accept=".csv,text/csv" hidden>' +
+      '<div class="toolbar"><input class="inp grow" data-inp="data-q" type="search" placeholder="Search records…" aria-label="Search records"><select class="inp" id="d-cat" data-chg="data-f" data-k="category" aria-label="Category"></select>' +
+      '<select class="inp" data-chg="data-f" data-k="status" aria-label="Status">' + opts(S.boot.lists.dataStatus, '', 'All statuses') + '</select>' +
+      '<input class="inp" type="date" data-chg="data-f" data-k="from" aria-label="From date" title="From date"><input class="inp" type="date" data-chg="data-f" data-k="to" aria-label="To date" title="To date">' +
+      '<select class="inp" data-chg="data-f" data-k="sort" aria-label="Sort"><option value="created:desc">Newest added</option><option value="created:asc">Oldest added</option><option value="date:desc">Entry date ↓</option><option value="date:asc">Entry date ↑</option><option value="title:asc">Title A–Z</option><option value="value:desc">Value high–low</option><option value="value:asc">Value low–high</option><option value="priority:asc">Priority</option><option value="status:asc">Status</option></select>' +
+      '<button class="btn danger sm" id="bulkDel" data-act="rec-bulk" hidden></button></div><div id="data-body"></div>';
+    b.dataset.ready = 1; icons();
+  }
+  if (!silent) $('#data-body').innerHTML = skel(4);
+  const D = S.data;
+  const r = await api('data.list', { q: D.q, category: D.category, status: D.status, from: D.from, to: D.to, sort: D.sort, page: D.page });
+  D.page = r.page; D.byId = {}; D.pageIds = r.rows.map(x => { D.byId[x.id] = x; return x.id; });
+  $('#d-cat').innerHTML = opts(S.cats, D.category, 'All categories');
+  renderData(r);
+};
+function renderData(r) {
+  const D = S.data;
+  if (!r.rows.length) { $('#data-body').innerHTML = empty('No records found', (D.q || D.category || D.status || D.from || D.to) ? 'Try adjusting or clearing the filters.' : 'Add your first record or import a CSV file.', '<br><button class="btn primary" data-act="rec-add">' + ic('plus') + ' Add Record</button>'); updateBulk(); icons(); return; }
+  const allOn = D.pageIds.every(id => D.sel.has(id));
+  $('#data-body').innerHTML = '<div class="tbl-wrap"><table class="rt cards"><thead><tr><th class="ck"><input type="checkbox" data-chg="data-all"' + (allOn ? ' checked' : '') + ' aria-label="Select all"></th><th>Date</th><th>Title</th><th>Category</th><th>Status</th><th>Priority</th><th class="num">Value</th><th>Updated</th><th></th></tr></thead><tbody>' +
+    r.rows.map(x => '<tr><td class="ck" data-label=""><input type="checkbox" data-chg="data-sel" value="' + esc(x.id) + '"' + (D.sel.has(x.id) ? ' checked' : '') + ' aria-label="Select"></td><td data-label="Date">' + fmtD(x.entryDate) + '</td><td data-label="Title"><span><b>' + esc(x.title) + '</b>' + (x.description ? '<br><small class="muted">' + esc(x.description.slice(0, 80)) + '</small>' : '') + '</span></td><td data-label="Category">' + esc(x.category) + '</td><td data-label="Status">' + statusBadge(x.status) + '</td><td data-label="Priority">' + priBadge(x.priority) + '</td><td data-label="Value" class="num">' + (x.valueAmount === '' ? '—' : fmtNum(x.valueAmount)) + '</td><td data-label="Updated">' + fmtDT(x.updatedAt) + '</td><td class="acts"><button class="icon-btn sm" title="Edit" data-act="rec-edit" data-id="' + esc(x.id) + '">' + ic('pencil') + '</button><button class="icon-btn sm" title="Delete" data-act="rec-del" data-id="' + esc(x.id) + '">' + ic('trash-2') + '</button></td></tr>').join('') +
+    '</tbody></table></div>' + pager('data', r.page, r.pages, r.total, 'records');
+  updateBulk(); icons();
+}
+function pager(key, page, pages, total, label) {
+  return '<div class="pager"><span>' + total + ' ' + (label || 'items') + ' · page ' + page + ' of ' + pages + '</span><div class="row"><button class="btn sm" data-act="pg" data-k="' + key + '" data-p="' + (page - 1) + '"' + (page <= 1 ? ' disabled' : '') + '>' + ic('chevron-left') + ' Prev</button><button class="btn sm" data-act="pg" data-k="' + key + '" data-p="' + (page + 1) + '"' + (page >= pages ? ' disabled' : '') + '>Next ' + ic('chevron-right') + '</button></div></div>';
+}
+ACT.pg = t => {
+  const p = +t.dataset.p, k = t.dataset.k;
+  if (k === 'data') { S.data.page = p; load('data', true); }
+  else if (k === 'audit') { S.admin.audit.page = p; renderAdmin(); }
+  else if (k.indexOf('adm:') === 0) { S.admin.pages[k.slice(4)] = p; renderAdmin(); }
+};
+function updateBulk() { const b = $('#bulkDel'); if (!b) return; const n = S.data.sel.size; b.hidden = n === 0; b.innerHTML = ic('trash-2') + ' Delete selected (' + n + ')'; icons(); }
+INP['data-q'] = debounce(el => { S.data.q = el.value; S.data.page = 1; load('data', true); }, 350);
+CHG['data-f'] = t => { S.data[t.dataset.k] = t.value; S.data.page = 1; load('data', true); };
+CHG['data-sel'] = t => { if (t.checked) S.data.sel.add(t.value); else S.data.sel.delete(t.value); updateBulk(); };
+CHG['data-all'] = t => { S.data.pageIds.forEach(id => { if (t.checked) S.data.sel.add(id); else S.data.sel.delete(id); }); $$('[data-chg="data-sel"]').forEach(c => { c.checked = t.checked; }); updateBulk(); };
+ACT['rec-add'] = addRecord;
+ACT['rec-edit'] = t => { const r = S.data.byId[t.dataset.id]; if (r) editRecord(r); };
+ACT['rec-del'] = async t => {
+  const r = S.data.byId[t.dataset.id]; if (!r) return;
+  if (!await confirmBox('Delete record?', '"' + r.title + '" will be removed from the sheet. A copy is kept in the audit log.', { danger: true, ok: 'Delete' })) return;
+  try { await api('data.delete', { ids: [r.id], confirm: true }); S.data.sel.delete(r.id); toast('Record deleted', 'success'); afterWrite(); } catch (e) { toast(e.message, 'error'); }
+};
+ACT['rec-bulk'] = async () => {
+  const ids = Array.from(S.data.sel); if (!ids.length) return;
+  if (!await confirmBox('Delete ' + ids.length + ' record(s)?', 'This removes them from the sheet. A copy of each is kept in the audit log.', { danger: true, ok: 'Delete ' + ids.length })) return;
+  try { const r = await api('data.delete', { ids, confirm: true }); S.data.sel.clear(); toast(r.deleted + ' record(s) deleted', 'success'); afterWrite(); } catch (e) { toast(e.message, 'error'); }
+};
+ACT['csv-export'] = async () => {
+  const D = S.data;
+  try { const r = await api('data.export', { q: D.q, category: D.category, status: D.status, from: D.from, to: D.to, sort: D.sort }); download(r.filename, '\uFEFF' + r.csv, 'text/csv;charset=utf-8'); toast('Exported ' + r.count + ' record(s)', 'success'); } catch (e) { toast(e.message, 'error'); }
+};
+function parseCSV(text) {
+  const rows = []; let row = [], cur = '', q = false; text = text.replace(/^\uFEFF/, '');
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) { if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; }
+    else if (c === '"') q = true;
+    else if (c === ',') { row.push(cur); cur = ''; }
+    else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cur); cur = ''; if (row.some(x => x !== '')) rows.push(row); row = []; }
+    else cur += c;
+  }
+  row.push(cur); if (row.some(x => x !== '')) rows.push(row);
+  return rows;
+}
+const CSV_MAP = { entrydate: 'entryDate', date: 'entryDate', category: 'category', title: 'title', name: 'title', description: 'description', value: 'valueAmount', amount: 'valueAmount', valueamount: 'valueAmount', status: 'status', priority: 'priority', remarks: 'remarks', notes: 'remarks' };
+ACT['csv-import'] = () => { const f = $('#csvFile'); f.value = ''; f.click(); };
+document.addEventListener('change', e => {
+  if (e.target.id !== 'csvFile' || !e.target.files[0]) return;
+  const file = e.target.files[0];
+  if (file.size > 5 * 1024 * 1024) { toast('CSV is larger than 5 MB. Split the file and import in parts.', 'error'); return; }
+  const rd = new FileReader();
+  rd.onload = () => {
+    const rows = parseCSV(String(rd.result));
+    if (rows.length < 2) { toast('The CSV needs a header row and at least one data row.', 'error'); return; }
+    const map = rows[0].map(h => CSV_MAP[h.toLowerCase().replace(/[^a-z]/g, '')] || null);
+    if (map.indexOf('title') < 0) { toast('The CSV needs a "Title" column. Recognised columns: Entry Date, Category, Title, Description, Value, Status, Priority, Remarks.', 'error'); return; }
+    const recs = rows.slice(1).map((r, i) => { const o = { _line: i + 2 }; map.forEach((k, c) => { if (k) o[k] = String(r[c] == null ? '' : r[c]).replace(/^'(?=[=+\-@])/, ''); }); if (!o.category) o.category = 'Other'; return o; });
+    openModal({ title: 'Import CSV', html: '<p class="muted-p"><b>' + recs.length + '</b> row(s) found in <b>' + esc(file.name) + '</b>. Recognised columns: ' + map.filter(Boolean).map(esc).join(', ') + '. Invalid rows are skipped and reported.</p><div class="modal-f"><button class="btn ghost" data-no>Cancel</button><button class="btn primary" id="doImp">Import ' + recs.length + ' rows</button></div>',
+      onMount: (el, close) => {
+        $('[data-no]', el).onclick = close;
+        $('#doImp', el).onclick = async () => {
+          const b = $('#doImp', el); b.disabled = true; let ok = 0, fail = 0, errs = [];
+          try {
+            for (let i = 0; i < recs.length; i += 300) { b.textContent = 'Importing… ' + Math.min(i + 300, recs.length) + '/' + recs.length; const r = await api('data.import', { rows: recs.slice(i, i + 300) }); ok += r.imported; fail += r.failed; errs = errs.concat(r.errors); }
+            close(); toast('Imported ' + ok + ' record(s)' + (fail ? ', ' + fail + ' skipped' : ''), fail ? 'info' : 'success');
+            if (fail) openModal({ title: 'Rows that were skipped', html: '<ul class="li">' + errs.slice(0, 20).map(x => '<li style="cursor:default"><div class="t"><b>Line ' + x.row + '</b><small>' + esc(x.error) + '</small></div></li>').join('') + '</ul>' });
+            afterWrite();
+          } catch (err) { toast(err.message + ' (' + ok + ' rows were imported before the error)', 'error'); close(); afterWrite(); }
+        };
+      } });
+  };
+  rd.readAsText(file);
+});
+
+/* ===================== ANALYTICS ===================== */
+LOADERS.analytics = async function (silent, force) {
+  const b = $('#page-analytics');
+  if (!b.dataset.ready) {
+    const A = S.an;
+    b.innerHTML = '<div class="page-h"><div><h1>Analytics</h1><p id="an-sub">Calculated on the server from your sheet data</p></div><button class="btn primary" data-act="an-refresh">' + ic('refresh-cw') + ' Refresh</button></div>' +
+      '<div class="toolbar"><div class="seg tabs-scroll" id="an-seg">' + [['today', 'Today'], ['7d', '7 Days'], ['30d', '30 Days'], ['month', 'This Month'], ['custom', 'Custom']].map(x => '<button data-act="an-range" data-v="' + x[0] + '">' + x[1] + '</button>').join('') + '</div>' +
+      '<input class="inp" type="date" id="an-from" data-chg="an-f" data-k="from" aria-label="From" hidden><input class="inp" type="date" id="an-to" data-chg="an-f" data-k="to" aria-label="To" hidden>' +
+      '<select class="inp" id="an-cat" data-chg="an-f" data-k="category" aria-label="Category"></select><select class="inp" data-chg="an-f" data-k="status" aria-label="Status">' + opts(S.boot.lists.dataStatus, A.status, 'All statuses') + '</select></div>' +
+      '<div class="stat-grid" id="an-stats"></div><div class="grid2" id="an-charts">' +
+      [['an-daily', 'Daily Records Added'], ['an-monthly', 'Monthly Records Trend (12 months)'], ['an-cat', 'Category Distribution'], ['an-status', 'Status Distribution'], ['an-task', 'Task Completion Trend'], ['an-pri', 'Priority Breakdown']].map(x => '<div class="card chart-card"><h3>' + x[1] + '<button class="icon-btn sm" title="Export PNG" data-act="png" data-id="' + x[0] + '">' + ic('download') + '</button></h3><div class="chart-box" id="box-' + x[0] + '"></div></div>').join('') + '</div>';
+    b.dataset.ready = 1; icons();
+  }
+  const A = S.an;
+  $('#an-cat').innerHTML = opts(S.cats, A.category, 'All categories');
+  $$('#an-seg button').forEach(x => x.classList.toggle('on', x.dataset.v === A.range));
+  $('#an-from').hidden = $('#an-to').hidden = A.range !== 'custom';
+  if (A.range === 'custom' && (!A.from || !A.to)) return;
+  if (!silent) $('#an-stats').innerHTML = '<div class="skel" style="grid-column:1/-1;min-height:70px"></div>';
+  const r = await api('analytics', { range: A.range, from: A.from, to: A.to, category: A.category, status: A.status, force: !!force });
+  S.an.last = r; renderAnalytics(r);
+};
+function renderAnalytics(r) {
+  const s = r.summary;
+  $('#an-sub').textContent = fmtD(r.filters.from) + ' – ' + fmtD(r.filters.to) + ' · last updated ' + fmtDT(r.generatedAt);
+  $('#an-stats').innerHTML = [['Records in range', s.recordsInRange], ['Total value', fmtNum(s.totalValue)], ['Average value', fmtNum(s.avgValue)], ['Tasks created', s.tasksCreated], ['Tasks completed', s.tasksCompleted], ['Task completion rate', s.completionRate + '%']].map(x => '<div class="stat"><b>' + x[1] + '</b><span>' + x[0] + '</span></div>').join('');
+  const long = r.daily.labels.length > 45;
+  mkChart('an-daily', 'line', r.daily.labels.map(shortDay), [ds('Records added', r.daily.values, 0, false)], { legend: false });
+  mkChart('an-monthly', 'bar', r.monthly.labels, [ds('Records', r.monthly.values, 0, false)], { legend: false });
+  mkChart('an-cat', 'doughnut', r.category.labels, pie('Records', r.category.values));
+  mkChart('an-status', 'pie', r.status.labels, pie('Records', r.status.values));
+  mkChart('an-task', 'line', r.taskTrend.labels.map(shortDay), [ds('Created', r.taskTrend.created, 0, true), ds('Completed', r.taskTrend.completed, 1, true)]);
+  mkChart('an-pri', 'bar', r.priority.labels, [{ label: 'Records', data: r.priority.values, backgroundColor: ['#94A3B8', '#F59E0B', '#EF4444'], borderRadius: 6 }], { legend: false });
+  if (long) { /* long ranges: x-axis auto-skips labels */ }
+}
+ACT['an-range'] = t => { S.an.range = t.dataset.v; if (t.dataset.v !== 'custom') load('analytics', true); else { $$('#an-seg button').forEach(x => x.classList.toggle('on', x.dataset.v === 'custom')); $('#an-from').hidden = $('#an-to').hidden = false; } };
+CHG['an-f'] = t => { S.an[t.dataset.k] = t.value; load('analytics', true); };
+ACT['an-refresh'] = () => { setSync('busy'); LOADERS.analytics(true, true).then(() => { markOk(); toast('Analytics refreshed', 'success'); }).catch(e => toast(e.message, 'error')); };
+
+/* ===================== TASKS ===================== */
+function taskFields() {
+  return [
+    { name: 'taskName', label: 'Task name', req: true, full: true },
+    { name: 'description', label: 'Description', type: 'textarea', full: true },
+    { name: 'category', label: 'Category', type: 'cat' },
+    { name: 'priority', label: 'Priority', type: 'select', options: S.boot.lists.priority },
+    { name: 'startDate', label: 'Start date', type: 'date' },
+    { name: 'dueDate', label: 'Due date', type: 'date' },
+    { name: 'status', label: 'Status', type: 'select', options: S.boot.lists.taskStatus }
+  ];
+}
+function addTask() { openForm({ title: 'Create task', fields: taskFields(), values: { category: 'Other', priority: 'Medium', status: 'To Do', dueDate: S.boot.today }, submit: 'Create task', onSubmit: async v => { await api('tasks.add', v); toast('Task created', 'success'); afterWrite(); } }); }
+function editTask(t) { openForm({ title: 'Edit task', fields: taskFields(), values: t, submit: 'Save changes', onSubmit: async v => { v.id = t.id; await api('tasks.update', v); toast('Task updated', 'success'); afterWrite(); } }); }
+LOADERS.tasks = async function (silent) {
+  const b = $('#page-tasks');
+  if (!b.dataset.ready) {
+    b.innerHTML = '<div class="page-h"><div><h1>Tasks</h1><p>Plan, track and complete your work</p></div><div class="row"><div class="seg"><button data-act="t-mode" data-v="list">' + ic('list') + ' List</button><button data-act="t-mode" data-v="kanban">' + ic('kanban') + ' Kanban</button></div><button class="btn primary" data-act="task-add">' + ic('plus') + ' Add Task</button></div></div>' +
+      '<div class="toolbar"><div class="seg tabs-scroll" id="t-views"></div></div>' +
+      '<div class="toolbar"><input class="inp grow" data-inp="t-q" type="search" placeholder="Search tasks…" aria-label="Search tasks"><select class="inp" data-chg="t-f" data-k="priority" aria-label="Priority">' + opts(S.boot.lists.priority, '', 'All priorities') + '</select><select class="inp" id="t-cat" data-chg="t-f" data-k="category" aria-label="Category"></select></div><div id="tasks-body"></div>';
+    b.dataset.ready = 1; icons();
+  }
+  if (!silent) $('#tasks-body').innerHTML = skel(4);
+  const T = S.tasks;
+  const r = await api('tasks.list', { view: T.view, q: T.q, priority: T.priority, category: T.category });
+  S.boot.today = r.today; T.counts = r.counts; T.byId = {}; r.tasks.forEach(t => { T.byId[t.id] = t; });
+  $('#t-cat').innerHTML = opts(S.cats, T.category, 'All categories');
+  renderTasks(r.tasks);
+};
+function renderTasks(list) {
+  const T = S.tasks, c = T.counts;
+  $('#t-views').innerHTML = [['all', 'All'], ['today', 'Today'], ['upcoming', 'Upcoming'], ['overdue', 'Overdue'], ['completed', 'Completed']].map(x => '<button data-act="t-view" data-v="' + x[0] + '" class="' + (T.view === x[0] ? 'on' : '') + '">' + x[1] + ' <span class="cnt">' + c[x[0]] + '</span></button>').join('');
+  $$('[data-act="t-mode"]').forEach(b => b.classList.toggle('on', b.dataset.v === T.mode));
+  const body = $('#tasks-body');
+  if (!list.length) { body.innerHTML = empty('No tasks here', T.view === 'all' ? 'Create your first task to get started.' : 'Nothing in this view.', '<br><button class="btn primary" data-act="task-add">' + ic('plus') + ' Add Task</button>'); icons(); return; }
+  if (T.mode === 'kanban') {
+    body.innerHTML = '<div class="kanban">' + S.boot.lists.taskStatus.map(st => {
+      const items = list.filter(t => t.status === st);
+      return '<div class="kcol" data-status="' + esc(st) + '"><h4>' + esc(st) + ' <span>' + items.length + '</span></h4>' + items.map(t =>
+        '<div class="kcard" draggable="true" data-id="' + esc(t.id) + '"><b>' + esc(t.taskName) + '</b><div class="chips">' + priBadge(t.priority) + '<span class="tag">' + esc(t.category) + '</span></div><small class="' + (t.overdue ? 'late' : 'muted') + '">' + (t.dueDate ? 'Due ' + fmtD(t.dueDate) : 'No due date') + '</small>' +
+        '<div class="row"><select class="inp" data-chg="t-move" data-id="' + esc(t.id) + '" aria-label="Move task">' + opts(S.boot.lists.taskStatus, t.status) + '</select><button class="icon-btn sm" data-act="task-edit" data-id="' + esc(t.id) + '" title="Edit">' + ic('pencil') + '</button><button class="icon-btn sm" data-act="task-del" data-id="' + esc(t.id) + '" title="Delete">' + ic('trash-2') + '</button></div></div>').join('') + '</div>';
+    }).join('') + '</div>';
+  } else {
+    body.innerHTML = '<div class="card" style="padding:0">' + list.map(t => {
+      const done = t.status === 'Completed';
+      return '<div class="task-row' + (done ? ' done' : '') + '"><label class="chk" title="' + (done ? 'Reopen' : 'Mark complete') + '"><input type="checkbox" data-chg="t-toggle" data-id="' + esc(t.id) + '"' + (done ? ' checked' : '') + '></label><div class="t"><b>' + esc(t.taskName) + '</b>' + (t.description ? '<br><small>' + esc(t.description.slice(0, 100)) + '</small>' : '') + '</div><div class="chips">' + priBadge(t.priority) + '<span class="tag">' + esc(t.category) + '</span>' + statusBadge(t.status) + '</div><small class="' + (t.overdue ? 'late' : '') + '">' + (t.overdue ? 'Overdue · ' : '') + (t.dueDate ? 'Due ' + fmtD(t.dueDate) : 'No due date') + '</small><div class="row"><button class="icon-btn sm" data-act="task-edit" data-id="' + esc(t.id) + '" title="Edit">' + ic('pencil') + '</button><button class="icon-btn sm" data-act="task-del" data-id="' + esc(t.id) + '" title="Delete">' + ic('trash-2') + '</button></div></div>';
+    }).join('') + '</div>';
+  }
+  icons();
+}
+ACT['task-add'] = addTask;
+ACT['t-mode'] = t => { S.tasks.mode = t.dataset.v; load('tasks', true); };
+ACT['t-view'] = t => { S.tasks.view = t.dataset.v; load('tasks', true); };
+INP['t-q'] = debounce(el => { S.tasks.q = el.value; load('tasks', true); }, 300);
+CHG['t-f'] = t => { S.tasks[t.dataset.k] = t.value; load('tasks', true); };
+ACT['task-edit'] = t => { const x = S.tasks.byId[t.dataset.id]; if (x) editTask(x); };
+async function setTaskStatus(id, status) { try { await api('tasks.status', { id, status }); toast(status === 'Completed' ? 'Task completed' : 'Task moved to ' + status, 'success'); afterWrite(); } catch (e) { toast(e.message, 'error'); load('tasks', true); } }
+CHG['t-toggle'] = t => setTaskStatus(t.dataset.id, t.checked ? 'Completed' : 'To Do');
+CHG['t-move'] = t => setTaskStatus(t.dataset.id, t.value);
+ACT['task-del'] = async t => {
+  const x = S.tasks.byId[t.dataset.id]; if (!x) return;
+  if (!await confirmBox('Delete task?', '"' + x.taskName + '" will be removed. A copy is kept in the audit log.', { danger: true, ok: 'Delete' })) return;
+  try { await api('tasks.delete', { id: x.id, confirm: true }); toast('Task deleted', 'success'); afterWrite(); } catch (e) { toast(e.message, 'error'); }
+};
+document.addEventListener('dragstart', e => { const c = e.target.closest && e.target.closest('.kcard'); if (c) { e.dataTransfer.setData('text/plain', c.dataset.id); e.dataTransfer.effectAllowed = 'move'; } });
+document.addEventListener('dragover', e => { const col = e.target.closest && e.target.closest('.kcol'); if (col) { e.preventDefault(); $$('.kcol').forEach(k => k.classList.toggle('over', k === col)); } });
+document.addEventListener('dragend', () => $$('.kcol').forEach(k => k.classList.remove('over')));
+document.addEventListener('drop', e => {
+  const col = e.target.closest && e.target.closest('.kcol'); if (!col) return; e.preventDefault();
+  $$('.kcol').forEach(k => k.classList.remove('over'));
+  const id = e.dataTransfer.getData('text/plain'), t = S.tasks.byId[id];
+  if (t && t.status !== col.dataset.status) setTaskStatus(id, col.dataset.status);
+});
+
+/* ===================== NOTES & REMINDERS ===================== */
+function noteFields() {
+  return [
+    { name: 'title', label: 'Title', req: true, full: true },
+    { name: 'content', label: 'Content (plain text)', type: 'textarea', full: true, rows: 7, max: 20000 },
+    { name: 'category', label: 'Category', type: 'cat' },
+    { name: 'tags', label: 'Tags (comma separated)' },
+    { name: 'pinned', type: 'checkbox', text: 'Pin this note' }
+  ];
+}
+function addNote() { openForm({ title: 'Add note', fields: noteFields(), values: { category: 'Personal' }, submit: 'Save note', onSubmit: async v => { await api('notes.add', v); toast('Note saved', 'success'); S.nr = 'notes'; if (S.page !== 'notes') go('notes'); else afterWrite(); } }); }
+function editNote(n) { openForm({ title: 'Edit note', fields: noteFields(), values: n, submit: 'Save changes', onSubmit: async v => { v.id = n.id; await api('notes.update', v); toast('Note updated', 'success'); afterWrite(); } }); }
+function remFields() {
+  return [
+    { name: 'reminderTitle', label: 'Reminder title', req: true, full: true },
+    { name: 'description', label: 'Description', type: 'textarea', full: true, rows: 2 },
+    { name: 'reminderDate', label: 'Date', type: 'date', req: true },
+    { name: 'reminderTime', label: 'Time', type: 'time' },
+    { name: 'repeatRule', label: 'Repeat', type: 'select', options: S.boot.lists.repeat },
+    { name: 'notificationChannel', label: 'Notify via', type: 'select', options: S.boot.lists.channel }
+  ];
+}
+const REM_INTRO = 'E-mail reminders are sent by a scheduled Google Apps Script trigger, which runs approximately (usually within a few minutes) – not on the exact second. Browser push notifications are not supported.';
+function addReminder() { openForm({ title: 'Set reminder', intro: REM_INTRO, fields: remFields(), values: { reminderDate: S.boot.today, reminderTime: '09:00', repeatRule: 'None', notificationChannel: 'Email' }, submit: 'Create reminder', onSubmit: async v => { await api('reminders.add', v); toast('Reminder created', 'success'); S.nr = 'reminders'; if (S.page !== 'notes') go('notes'); else { setNR(); afterWrite(); } } }); }
+function editReminder(r) { openForm({ title: 'Edit reminder', intro: 'Saving re-arms the reminder.', fields: remFields(), values: r, submit: 'Save changes', onSubmit: async v => { v.id = r.id; await api('reminders.update', v); toast('Reminder updated', 'success'); afterWrite(); } }); }
+LOADERS.notes = async function (silent) {
+  const b = $('#page-notes');
+  if (!b.dataset.ready) {
+    b.innerHTML = '<div class="page-h"><div><h1>Notes &amp; Reminders</h1><p>Capture ideas and never miss a deadline</p></div><div class="row"><div class="seg"><button data-act="nr-tab" data-v="notes">' + ic('sticky-note') + ' Notes</button><button data-act="nr-tab" data-v="reminders">' + ic('bell') + ' Reminders</button></div><button class="btn primary" data-act="nr-add">' + ic('plus') + ' <span id="nr-add-l">Add</span></button></div></div><div id="nr-body"></div>';
+    b.dataset.ready = 1; icons();
+  }
+  setNR();
+  if (S.nr === 'notes') await loadNotesTab(silent); else await loadRemTab(silent);
+};
+function setNR() { $$('[data-act="nr-tab"]').forEach(x => x.classList.toggle('on', x.dataset.v === S.nr)); const l = $('#nr-add-l'); if (l) l.textContent = S.nr === 'notes' ? 'Add Note' : 'Set Reminder'; }
+ACT['nr-tab'] = t => { S.nr = t.dataset.v; setNR(); load('notes', false); };
+ACT['nr-add'] = () => { if (S.nr === 'notes') addNote(); else addReminder(); };
+function setNotesTab(v) { S.nr = v; }
+
+async function loadNotesTab(silent) {
+  const N = S.notes, body = $('#nr-body');
+  if (!$('#n-list')) {
+    body.innerHTML = '<div class="toolbar"><input class="inp grow" data-inp="n-q" type="search" placeholder="Search notes…" aria-label="Search notes"><select class="inp" id="n-cat" data-chg="n-f" data-k="category" aria-label="Category"></select><div class="seg" id="n-arch"></div></div><div id="n-list"></div>';
+  }
+  if (!silent) $('#n-list').innerHTML = skel(3);
+  const r = await api('notes.list', { q: N.q, category: N.category, archived: N.archived });
+  N.counts = r.counts; N.byId = {}; r.notes.forEach(n => { N.byId[n.id] = n; });
+  $('#n-cat').innerHTML = opts(S.cats, N.category, 'All categories');
+  $('#n-arch').innerHTML = '<button data-act="n-arch" data-v="0" class="' + (!N.archived ? 'on' : '') + '">Active <span class="cnt">' + r.counts.active + '</span></button><button data-act="n-arch" data-v="1" class="' + (N.archived ? 'on' : '') + '">Archived <span class="cnt">' + r.counts.archived + '</span></button>';
+  $('#n-list').innerHTML = r.notes.length ? '<div class="grid3">' + r.notes.map(n =>
+    '<div class="card note-card' + (n.pinned ? ' pinned' : '') + '"><div class="row" style="justify-content:space-between;flex-wrap:nowrap"><b style="overflow-wrap:anywhere">' + (n.pinned ? '📌 ' : '') + esc(n.title) + '</b><span class="tag">' + esc(n.category) + '</span></div>' +
+    '<div class="nt">' + esc(n.content) + '</div>' + (n.tags ? '<div class="chips">' + n.tags.split(',').map(t => '<span class="tag">#' + esc(t.trim()) + '</span>').join('') + '</div>' : '') + '<small class="muted">Updated ' + fmtDT(n.updatedAt) + '</small>' +
+    '<div class="na"><button class="icon-btn sm ' + (n.pinned ? 'on' : '') + '" title="Pin" data-act="n-pin" data-id="' + esc(n.id) + '">' + ic('pin') + '</button><button class="icon-btn sm" title="Copy" data-act="n-copy" data-id="' + esc(n.id) + '">' + ic('copy') + '</button><button class="icon-btn sm" title="Edit" data-act="n-edit" data-id="' + esc(n.id) + '">' + ic('pencil') + '</button><button class="icon-btn sm" title="' + (n.archived ? 'Unarchive' : 'Archive') + '" data-act="n-archive" data-id="' + esc(n.id) + '">' + ic('archive') + '</button><button class="icon-btn sm" title="Delete" data-act="n-del" data-id="' + esc(n.id) + '">' + ic('trash-2') + '</button></div></div>').join('') + '</div>' :
+    empty(N.archived ? 'No archived notes' : 'No notes yet', N.archived ? 'Archived notes appear here.' : 'Write down your first idea.', N.archived ? '' : '<br><button class="btn primary" data-act="nr-add">' + ic('plus') + ' Add Note</button>');
+  icons();
+}
+INP['n-q'] = debounce(el => { S.notes.q = el.value; load('notes', true); }, 300);
+CHG['n-f'] = t => { S.notes[t.dataset.k] = t.value; load('notes', true); };
+ACT['n-arch'] = t => { S.notes.archived = t.dataset.v === '1'; load('notes', true); };
+ACT['n-edit'] = t => { const n = S.notes.byId[t.dataset.id]; if (n) editNote(n); };
+ACT['n-copy'] = t => { const n = S.notes.byId[t.dataset.id]; if (n) copyText(n.title + '\n\n' + n.content); };
+ACT['n-pin'] = async t => { try { await api('notes.pin', { id: t.dataset.id }); afterWrite(); } catch (e) { toast(e.message, 'error'); } };
+ACT['n-archive'] = async t => { try { await api('notes.archive', { id: t.dataset.id }); toast('Note moved', 'success'); afterWrite(); } catch (e) { toast(e.message, 'error'); } };
+ACT['n-del'] = async t => {
+  const n = S.notes.byId[t.dataset.id]; if (!n) return;
+  if (!await confirmBox('Delete note?', '"' + n.title + '" will be removed. A copy is kept in the audit log.', { danger: true, ok: 'Delete' })) return;
+  try { await api('notes.delete', { id: n.id, confirm: true }); toast('Note deleted', 'success'); afterWrite(); } catch (e) { toast(e.message, 'error'); }
+};
+
+async function loadRemTab(silent) {
+  const R = S.rem, body = $('#nr-body');
+  if (!$('#r-list')) {
+    body.innerHTML = '<div class="alert info">' + ic('info') + '<div>' + esc(REM_INTRO) + '</div></div><div class="toolbar"><div class="seg tabs-scroll" id="r-views"></div><input class="inp grow" data-inp="r-q" type="search" placeholder="Search reminders…" aria-label="Search reminders"></div><div id="r-list"></div>';
+  }
+  if (!silent) $('#r-list').innerHTML = skel(3);
+  const r = await api('reminders.list', { view: R.view, q: R.q });
+  R.counts = r.counts; R.byId = {}; r.reminders.forEach(x => { R.byId[x.id] = x; });
+  $('#r-views').innerHTML = [['upcoming', 'Upcoming', r.counts.upcoming], ['overdue', 'Overdue', r.counts.overdue], ['done', 'Sent / Completed', r.counts.done], ['all', 'All', r.counts.all]].map(x => '<button data-act="r-view" data-v="' + x[0] + '" class="' + (R.view === x[0] ? 'on' : '') + '">' + x[1] + ' <span class="cnt">' + x[2] + '</span></button>').join('');
+  $('#r-list').innerHTML = r.reminders.length ? '<div class="card" style="padding:0">' + r.reminders.map(x =>
+    '<div class="task-row' + (x.status !== 'Active' ? ' done' : '') + '"><div class="t"><b>' + esc(x.reminderTitle) + '</b>' + (x.description ? '<br><small>' + esc(x.description.slice(0, 100)) + '</small>' : '') + '</div><div class="chips">' + (x.overdue ? badge('Overdue', 'bad') : '') + statusBadge(x.status) + '<span class="tag">' + ic('repeat') + ' ' + esc(x.repeatRule) + '</span><span class="tag">' + ic(x.notificationChannel === 'Email' ? 'mail' : 'bell') + ' ' + esc(x.notificationChannel) + '</span></div>' +
+    '<small class="' + (x.overdue ? 'late' : '') + '">' + fmtD(x.reminderDate) + ' ' + esc(x.reminderTime) + (x.lastSentAt ? '<br>Last sent ' + fmtDT(x.lastSentAt) : '') + '</small><div class="row">' +
+    (x.status === 'Active' ? '<button class="icon-btn sm" title="Mark complete" data-act="r-done" data-id="' + esc(x.id) + '">' + ic('check') + '</button>' : '<button class="icon-btn sm" title="Reopen" data-act="r-reopen" data-id="' + esc(x.id) + '">' + ic('rotate-ccw') + '</button>') +
+    '<button class="icon-btn sm" title="Edit" data-act="r-edit" data-id="' + esc(x.id) + '">' + ic('pencil') + '</button><button class="icon-btn sm" title="Delete" data-act="r-del" data-id="' + esc(x.id) + '">' + ic('trash-2') + '</button></div></div>').join('') + '</div>' :
+    empty('No reminders here', R.view === 'upcoming' ? 'Set a reminder and it will show up here.' : 'Nothing in this list.', '<br><button class="btn primary" data-act="nr-add">' + ic('plus') + ' Set Reminder</button>');
+  icons();
+}
+INP['r-q'] = debounce(el => { S.rem.q = el.value; load('notes', true); }, 300);
+ACT['r-view'] = t => { S.rem.view = t.dataset.v; load('notes', true); };
+ACT['r-edit'] = t => { const x = S.rem.byId[t.dataset.id]; if (x) editReminder(x); };
+ACT['r-done'] = async t => { try { await api('reminders.complete', { id: t.dataset.id }); toast('Reminder completed', 'success'); afterWrite(); } catch (e) { toast(e.message, 'error'); } };
+ACT['r-reopen'] = async t => { try { await api('reminders.reopen', { id: t.dataset.id }); toast('Reminder re-activated', 'success'); afterWrite(); } catch (e) { toast(e.message, 'error'); } };
+ACT['r-del'] = async t => {
+  const x = S.rem.byId[t.dataset.id]; if (!x) return;
+  if (!await confirmBox('Delete reminder?', '"' + x.reminderTitle + '" will be removed. A copy is kept in the audit log.', { danger: true, ok: 'Delete' })) return;
+  try { await api('reminders.delete', { id: x.id, confirm: true }); toast('Reminder deleted', 'success'); afterWrite(); } catch (e) { toast(e.message, 'error'); }
+};
+
+/* ===================== SETTINGS ===================== */
+function setRow(d) {
+  const v = S.boot.settings[d.key]; let inp;
+  if (d.type === 'bool') inp = '<label class="switch"><input type="checkbox" name="' + d.key + '"' + (String(v).toUpperCase() === 'TRUE' ? ' checked' : '') + '><span></span></label>';
+  else if (d.type === 'select') inp = '<select class="inp" name="' + d.key + '">' + opts(d.options, v) + '</select>';
+  else if (d.type === 'number') inp = '<input class="inp" type="number" name="' + d.key + '" min="' + d.min + '" max="' + d.max + '" value="' + esc(v) + '">';
+  else if (d.type === 'list') inp = '<textarea class="inp" rows="3" name="' + d.key + '">' + esc(v) + '</textarea>';
+  else inp = '<input class="inp" name="' + d.key + '" value="' + esc(v) + '" maxlength="200">';
+  return '<div class="set-row"><div><b>' + esc(d.label) + '</b><div class="muted-s">' + esc(d.desc) + '</div></div>' + inp + '</div>';
+}
+function settingsForm(group) {
+  const defs = S.boot.settingDefs.filter(d => d.group === group);
+  return '<form class="card" data-form="settings-' + group + '">' + defs.map(setRow).join('') + '<div class="modal-f"><button class="btn primary" type="submit">' + ic('save') + ' Save settings</button></div><div class="ferr" role="alert"></div></form>';
+}
+async function saveSettingsForm(f) {
+  const group = f.dataset.form.slice(9), values = {};
+  S.boot.settingDefs.filter(d => d.group === group).forEach(d => { const el = f.elements[d.key]; if (el) values[d.key] = d.type === 'bool' ? el.checked : el.value; });
+  const btn = $('button[type=submit]', f), err = $('.ferr', f); btn.disabled = true; err.textContent = '';
+  try {
+    const r = await api('settings.save', { values }); S.boot.settings = r.settings; setCats(r.categories);
+    applySettings(); toast('Settings saved', 'success');
+  } catch (e) { err.textContent = e.message; toast(e.message, 'error'); }
+  btn.disabled = false;
+}
+function applySettings() { $('#brandName').textContent = S.boot.settings.APP_NAME; document.title = S.boot.settings.APP_NAME; startPolling(); setSync('ok'); }
+LOADERS.settings = async function () {
+  const b = $('#page-settings');
+  b.innerHTML = '<div class="page-h"><div><h1>Settings</h1><p>Personalise how MasterSheet looks and refreshes</p></div></div>' +
+    '<div class="card" style="margin-bottom:14px"><div class="set-row"><div><b>Theme on this device</b><div class="muted-s">Light or dark. Saved in this browser.</div></div><button class="btn" data-act="theme">' + ic('sun') + ' Toggle theme</button></div>' +
+    '<div class="set-row"><div><b>Dashboard widgets</b><div class="muted-s">Choose what the dashboard shows.</div></div><button class="btn" data-act="dash-widgets">' + ic('sliders-horizontal') + ' Customize</button></div>' +
+    '<div class="set-row"><div><b>Synchronisation</b><div class="muted-s">The website reads your sheet periodically (default every 60 s) and immediately after each of your own changes. Edits made directly inside Google Sheets appear on the next refresh – it is not instant.</div></div><button class="btn" data-act="dash-refresh">' + ic('refresh-cw') + ' Refresh now</button></div></div>' + settingsForm('user');
+  icons();
+};
+
+/* ===================== ADMIN ===================== */
+const ADMIN_TABS = [['overview', 'Overview'], ['sheets', 'Manage Sheets'], ['records', 'Manage Records'], ['tasks', 'Manage Tasks'], ['notes', 'Manage Notes'], ['reminders', 'Manage Reminders'], ['automation', 'Automation Settings'], ['audit', 'Audit Logs'], ['backups', 'Backup Management'], ['system', 'System Settings']];
+LOADERS.admin = async function (silent) {
+  const b = $('#page-admin');
+  if (!b.dataset.ready) {
+    b.innerHTML = '<div class="page-h"><div><h1>Admin Panel</h1><p>Private control centre – owner only, verified on every request</p></div></div><div class="toolbar"><div class="seg tabs-scroll" id="adm-tabs">' +
+      ADMIN_TABS.map(x => '<button data-act="adm-tab" data-t="' + x[0] + '">' + x[1] + '</button>').join('') + '</div></div><div id="adm-body"></div>';
+    b.dataset.ready = 1;
+  }
+  if (!silent) await renderAdmin();
+};
+ACT['adm-tab'] = t => { S.admin.tab = t.dataset.t; renderAdmin(); };
+async function renderAdmin() {
+  const A = S.admin, body = $('#adm-body'); if (!body) return;
+  $$('#adm-tabs button').forEach(x => x.classList.toggle('on', x.dataset.t === A.tab));
+  body.innerHTML = skel(3);
+  try {
+    if (A.tab === 'overview') await admOverview(body);
+    else if (['sheets', 'records', 'tasks', 'notes', 'reminders'].indexOf(A.tab) >= 0) await admManage(body, A.tab);
+    else if (A.tab === 'automation') await admAutomation(body);
+    else if (A.tab === 'audit') await admAudit(body);
+    else if (A.tab === 'backups') await admBackups(body);
+    else if (A.tab === 'system') admSystem(body);
+  } catch (e) { body.innerHTML = '<div class="alert warn">' + ic('alert-triangle') + '<div>' + esc(e.message) + '</div></div>'; }
+  icons();
+}
+async function admOverview(body) {
+  const o = await api('admin.overview');
+  body.innerHTML = '<div class="stat-grid">' + Object.keys(o.counts).map(k => '<div class="stat"><b>' + o.counts[k] + '</b><span>' + k + ' rows</span></div>').join('') + '</div>' +
+    '<div class="grid2"><div class="card"><h3>System status</h3><ul class="li">' +
+    '<li style="cursor:default"><div class="t"><b>Owner account</b><small>' + esc(o.owner) + '</small></div></li>' +
+    '<li style="cursor:default"><div class="t"><b>Automation triggers</b><small>' + (o.triggersInstalled ? 'Installed' : 'Not installed – open Automation Settings') + '</small></div>' + badge(o.triggersInstalled ? 'OK' : 'Action needed', o.triggersInstalled ? 'ok' : 'warn') + '</li>' +
+    '<li style="cursor:default"><div class="t"><b>Last successful backup</b><small>' + (o.lastBackup ? fmtDT(o.lastBackup.timestamp) + ' · ' + esc(o.lastBackup.type) : 'None yet') + '</small></div></li>' +
+    '<li style="cursor:default"><div class="t"><b>Errors in the last 24 h</b><small>From the automation log</small></div>' + badge(String(o.errors24h), o.errors24h ? 'bad' : 'ok') + '</li>' +
+    '<li style="cursor:default"><div class="t"><b>Overdue tasks (last check)</b></div>' + badge(String(o.overdueCount), o.overdueCount ? 'warn' : 'ok') + '</li>' +
+    '<li style="cursor:default"><div class="t"><b>E-mail quota left today</b></div>' + badge(o.mailQuota == null ? 'n/a' : String(o.mailQuota), '') + '</li>' +
+    '<li style="cursor:default"><div class="t"><b>Time zone</b><small>' + esc(o.tz) + ' (spreadsheet setting)</small></div></li></ul>' +
+    '<div class="modal-f"><a class="btn" href="' + esc(o.spreadsheetUrl) + '" target="_blank" rel="noopener">' + ic('external-link') + ' Open database spreadsheet</a></div></div>' +
+    '<div class="card"><h3>Recent automation runs</h3>' + listOr(o.recentAutomation, a => '<li style="cursor:default"><div class="t"><b>' + esc(a.job) + '</b><small>' + fmtDT(a.timestamp) + ' · ' + esc(a.message) + '</small></div>' + badge(a.result, a.result === 'Error' ? 'bad' : 'ok') + '</li>', 'No automation has run yet.') + '</div></div>';
+}
+async function admManage(body, tab) {
+  const A = S.admin, page = A.pages[tab] || 1, q = A.q[tab] || '', sel = A.sel[tab] || (A.sel[tab] = new Set());
+  const r = await api('admin.list', { tab, q, page }); A.pages[tab] = r.page;
+  const val = (c, x) => { const v = x[c.key]; return typeof v === 'boolean' ? (v ? 'Yes' : 'No') : esc(v === '' ? '—' : v); };
+  body.innerHTML = '<div class="toolbar"><input class="inp grow" data-inp="adm-q" data-t="' + tab + '" type="search" value="' + esc(q) + '" placeholder="Search…" aria-label="Search"><button class="btn danger sm" data-act="adm-del" data-t="' + tab + '"' + (sel.size ? '' : ' hidden') + ' id="adm-del">' + ic('trash-2') + ' Delete selected (' + sel.size + ')</button></div>' +
+    (r.rows.length ? '<div class="tbl-wrap"><table class="rt cards"><thead><tr><th class="ck"></th>' + r.columns.map(c => '<th>' + esc(c.label) + '</th>').join('') + '</tr></thead><tbody>' +
+      r.rows.map(x => '<tr><td class="ck" data-label=""><input type="checkbox" data-chg="adm-sel" data-t="' + tab + '" value="' + esc(x.id) + '"' + (sel.has(x.id) ? ' checked' : '') + '></td>' + r.columns.map(c => '<td data-label="' + esc(c.label) + '">' + val(c, x) + '</td>').join('') + '</tr>').join('') + '</tbody></table></div>' + pager('adm:' + tab, r.page, r.pages, r.total, 'items') : empty('Nothing here', 'No items match.'));
+}
+INP['adm-q'] = debounce(el => { S.admin.q[el.dataset.t] = el.value; S.admin.pages[el.dataset.t] = 1; renderAdmin(); }, 400);
+CHG['adm-sel'] = t => { const s = S.admin.sel[t.dataset.t]; if (t.checked) s.add(t.value); else s.delete(t.value); const b = $('#adm-del'); if (b) { b.hidden = s.size === 0; b.innerHTML = ic('trash-2') + ' Delete selected (' + s.size + ')'; icons(); } };
+ACT['adm-del'] = async t => {
+  const tab = t.dataset.t, ids = Array.from(S.admin.sel[tab] || []);
+  if (!ids.length) return;
+  if (!await confirmBox('Delete ' + ids.length + ' item(s)?', 'They will be removed from the sheet. A copy of each is kept in the audit log.', { danger: true, ok: 'Delete' })) return;
+  try { const r = await api('admin.delete', { tab, ids, confirm: true }); S.admin.sel[tab].clear(); toast(r.deleted + ' item(s) deleted', 'success'); renderAdmin(); refreshBell(); } catch (e) { toast(e.message, 'error'); }
+};
+async function admAutomation(body) {
+  const a = await api('admin.automation');
+  body.innerHTML = '<div class="alert info">' + ic('info') + '<div>Scheduled jobs run through Google Apps Script time-driven triggers. Google may delay a run by a few minutes, so timing is approximate. Triggers must be installed once.</div></div>' +
+    '<div class="grid2"><div class="card"><h3>Jobs</h3>' + a.jobs.map(j => '<div class="set-row"><div><b>' + esc(j.label) + '</b></div><label class="switch"><input type="checkbox" data-chg="job-toggle" data-k="' + j.key + '"' + (j.value ? ' checked' : '') + '><span></span></label></div>').join('') + '</div>' +
+    '<div class="card"><h3>Triggers</h3>' + a.triggers.map(t => '<div class="set-row"><div><b>' + esc(t.handler) + '</b></div>' + badge(t.installed ? 'Installed' : 'Missing', t.installed ? 'ok' : 'warn') + '</div>').join('') +
+    '<div class="modal-f"><button class="btn" data-act="trg-remove">Remove triggers</button><button class="btn primary" data-act="trg-install">' + ic('zap') + ' Install / reinstall triggers</button></div>' +
+    '<h3 style="margin-top:18px">Run a job now</h3><div class="row">' + [['reminders', 'Reminders'], ['overdue', 'Overdue check'], ['summary', 'Refresh summary'], ['backup', 'Backup'], ['cleanup', 'Log cleanup']].map(x => '<button class="btn sm" data-act="job-run" data-j="' + x[0] + '">' + x[1] + '</button>').join('') + '</div></div></div>' +
+    '<div class="card" style="margin-top:14px"><h3>Automation log</h3>' + (a.log.length ? '<div class="tbl-wrap"><table class="rt cards"><thead><tr><th>Time</th><th>Job</th><th>Result</th><th class="num">ms</th><th>Message</th></tr></thead><tbody>' + a.log.map(l => '<tr><td data-label="Time">' + fmtDT(l.timestamp) + '</td><td data-label="Job">' + esc(l.job) + '</td><td data-label="Result">' + badge(l.result, l.result === 'Error' ? 'bad' : 'ok') + '</td><td data-label="ms" class="num">' + esc(l.durationMs) + '</td><td data-label="Message">' + esc(l.message) + '</td></tr>').join('') + '</tbody></table></div>' : '<div class="empty-sm">No runs logged yet.</div>') + '</div>';
+}
+CHG['job-toggle'] = async t => { try { const r = await api('settings.save', { values: { [t.dataset.k]: t.checked } }); S.boot.settings = r.settings; toast('Job setting saved', 'success'); } catch (e) { t.checked = !t.checked; toast(e.message, 'error'); } };
+ACT['trg-install'] = async () => { try { const r = await api('admin.installTriggers'); toast(r.message, 'success'); renderAdmin(); } catch (e) { toast(e.message, 'error'); } };
+ACT['trg-remove'] = async () => { try { const r = await api('admin.removeTriggers'); toast(r.message, 'success'); renderAdmin(); } catch (e) { toast(e.message, 'error'); } };
+ACT['job-run'] = async t => { t.disabled = true; try { const r = await api('admin.runJob', { job: t.dataset.j }); toast(r.message, r.ok === false ? 'error' : 'success'); renderAdmin(); refreshBell(); } catch (e) { toast(e.message, 'error'); t.disabled = false; } };
+async function admAudit(body) {
+  const au = S.admin.audit, r = await api('admin.audit', { q: au.q, module: au.module, page: au.page }); au.page = r.page;
+  body.innerHTML = '<div class="toolbar"><input class="inp grow" data-inp="au-q" type="search" value="' + esc(au.q) + '" placeholder="Search audit log…" aria-label="Search audit log"><select class="inp" data-chg="au-m" aria-label="Module">' + opts(['Sheets', 'Data', 'Tasks', 'Notes', 'Reminders', 'Settings', 'Backup'], au.module, 'All modules') + '</select></div><p class="muted-s">Showing the latest 1,500 audit entries. Deleted items keep a full copy under "Before".</p>' +
+    (r.rows.length ? '<div class="card" style="padding:6px 14px">' + r.rows.map(x => '<details class="audit"><summary>' + badge(x.module) + ' <b>' + esc(x.action) + '</b><span class="muted-s">' + esc(x.recordId) + ' · ' + fmtDT(x.timestamp) + ' · ' + esc(x.user) + '</span></summary>' + (x.before ? '<div class="muted-s">Before</div><pre class="json">' + esc(x.before) + '</pre>' : '') + (x.after ? '<div class="muted-s">After</div><pre class="json">' + esc(x.after) + '</pre>' : '') + '</details>').join('') + '</div>' + pager('audit', r.page, r.pages, r.total, 'entries') : empty('No audit entries', 'Changes will be listed here.'));
+}
+INP['au-q'] = debounce(el => { S.admin.audit.q = el.value; S.admin.audit.page = 1; renderAdmin(); }, 400);
+CHG['au-m'] = t => { S.admin.audit.module = t.value; S.admin.audit.page = 1; renderAdmin(); };
+async function admBackups(body) {
+  const r = await api('admin.backups');
+  body.innerHTML = '<div class="page-h"><div><p>Backups are full copies of the database spreadsheet saved in your Google Drive folder "MasterSheet Backups". The newest ' + r.retention + ' are kept.</p></div><button class="btn primary" data-act="bk-create">' + ic('save') + ' Create backup now</button></div>' +
+    (r.backups.length ? '<div class="tbl-wrap"><table class="rt cards"><thead><tr><th>Time</th><th>Type</th><th>Name</th><th>Status</th><th></th></tr></thead><tbody>' + r.backups.map(b => '<tr><td data-label="Time">' + fmtDT(b.timestamp) + '</td><td data-label="Type">' + esc(b.type) + '</td><td data-label="Name">' + (b.fileUrl ? '<a href="' + esc(b.fileUrl) + '" target="_blank" rel="noopener">' + esc(b.fileName) + '</a>' : esc(b.fileName)) + '</td><td data-label="Status">' + badge(b.status, b.status === 'OK' ? 'ok' : b.status === 'Failed' ? 'bad' : 'mut') + '</td><td class="acts">' + (b.status === 'OK' ? '<button class="btn sm" data-act="bk-restore" data-id="' + esc(b.id) + '" data-n="' + esc(b.fileName) + '">' + ic('rotate-ccw') + ' Restore</button> <button class="icon-btn sm" title="Delete backup" data-act="bk-del" data-id="' + esc(b.id) + '">' + ic('trash-2') + '</button>' : '') + '</td></tr>').join('') + '</tbody></table></div>' : empty('No backups yet', 'Create your first backup.'));
+}
+ACT['bk-create'] = async t => { t.disabled = true; try { const b = await api('admin.backupCreate'); toast('Backup created: ' + b.fileName, 'success'); renderAdmin(); } catch (e) { toast(e.message, 'error'); t.disabled = false; } };
+ACT['bk-del'] = async t => {
+  if (!await confirmBox('Delete this backup?', 'The backup file is moved to your Drive trash.', { danger: true, ok: 'Delete' })) return;
+  try { await api('admin.backupDelete', { id: t.dataset.id, confirm: true }); toast('Backup deleted', 'success'); renderAdmin(); } catch (e) { toast(e.message, 'error'); }
+};
+ACT['bk-restore'] = async t => {
+  const word = await confirmBox('Restore from backup?', 'This REPLACES the current sheets, records, tasks, notes and reminders with the data from "' + t.dataset.n + '". A safety backup of the current state is created first. Logs and settings are kept.', { danger: true, ok: 'Restore', typed: 'RESTORE' });
+  if (word !== 'RESTORE') return;
+  toast('Restoring… please wait', 'info');
+  try { const r = await api('admin.backupRestore', { id: t.dataset.id, confirm: 'RESTORE' }); toast(r.message, 'success'); renderAdmin(); refreshBell(); } catch (e) { toast(e.message, 'error'); }
+};
+function admSystem(body) {
+  body.innerHTML = settingsForm('system') + '<div class="card" style="margin-top:14px"><h3>Owner &amp; security</h3><p class="muted-p">Access is limited to the owner account stored in Script Properties (OWNER_EMAIL). To transfer ownership, delete that property in the Apps Script editor and run setupMasterSheet() as the new owner.</p></div>';
+}
+
+/* ===================== polling & init ===================== */
+function startPolling() {
+  clearInterval(S.poll);
+  const sec = Number(S.boot.settings.POLL_INTERVAL_SEC) || 0;
+  if (sec <= 0) return;
+  S.poll = setInterval(tick, Math.max(15, sec) * 1000);
+}
+async function tick() {
+  if (document.hidden || $('.modal-back') || S.refreshing || ['admin', 'settings'].indexOf(S.page) >= 0) return;
+  S.refreshing = true;
+  try { await refreshBell(); await LOADERS[S.page](true); markOk(); } catch (e) { setSync('err'); } finally { S.refreshing = false; }
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && S.boot && Date.now() - S.lastOk > 20000) tick(); });
+window.addEventListener('online', () => tick());
+window.addEventListener('offline', () => setSync('err'));
+
+async function init() {
+  try { S.boot = await api('boot'); }
+  catch (e) { $('#content').innerHTML = '<div class="alert warn"><div>' + esc(e.message) + '</div></div>'; icons(); return; }
+  let theme = 'dark'; try { theme = localStorage.getItem('ms-theme') || S.boot.settings.DEFAULT_THEME || 'dark'; } catch (e) { /* ignore */ }
+  applyTheme(theme); setCats(S.boot.categories); applySettings();
+  $('#avatar').textContent = (S.boot.user || 'M').charAt(0).toUpperCase(); $('#avatar').title = S.boot.user;
+  $('#gsearch').setAttribute('data-inp', 'gsearch');
+  refreshBell();
+  let last = 'dashboard'; try { last = localStorage.getItem('ms-page') || 'dashboard'; } catch (e) { /* ignore */ }
+  if (!LOADERS[last]) last = 'dashboard';
+  go(last); icons();
+}
+init();
+})();
+</script>

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <title>MasterSheet</title>
+  <script>
+    try { document.documentElement.className = 'theme-' + (localStorage.getItem('ms-theme') || 'dark'); } catch (e) { document.documentElement.className = 'theme-dark'; }
+  </script>
+  <?!= include_('Styles') ?>
+</head>
+<body>
+  <div id="app" class="app">
+    <aside id="sidebar" class="sidebar">
+      <div class="brand">
+        <span class="brand-logo"><i data-lucide="file-spreadsheet"></i></span>
+        <span class="brand-name" id="brandName">MasterSheet</span>
+      </div>
+      <nav class="nav" id="sideNav">
+        <a href="#" data-act="nav" data-page="dashboard"><i data-lucide="layout-dashboard"></i><span>Dashboard</span></a>
+        <a href="#" data-act="nav" data-page="library"><i data-lucide="file-spreadsheet"></i><span>My Sheets</span></a>
+        <a href="#" data-act="nav" data-page="data"><i data-lucide="database"></i><span>Data Entry</span></a>
+        <a href="#" data-act="nav" data-page="analytics"><i data-lucide="bar-chart-3"></i><span>Analytics</span></a>
+        <a href="#" data-act="nav" data-page="tasks"><i data-lucide="check-square"></i><span>Tasks</span></a>
+        <a href="#" data-act="nav" data-page="notes"><i data-lucide="sticky-note"></i><span>Notes &amp; Reminders</span></a>
+        <a href="#" data-act="nav" data-page="admin"><i data-lucide="shield-check"></i><span>Admin Panel</span></a>
+        <a href="#" data-act="nav" data-page="settings"><i data-lucide="settings"></i><span>Settings</span></a>
+      </nav>
+      <div class="side-foot"><span id="sideSync" class="muted-s">Not synced yet</span></div>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <button class="icon-btn" data-act="toggle-side" aria-label="Toggle sidebar"><i data-lucide="menu"></i></button>
+        <div class="gsearch">
+          <i data-lucide="search"></i>
+          <input id="gsearch" type="search" placeholder="Search sheets, records, tasks, notes…" autocomplete="off" aria-label="Global search">
+          <div id="gsearch-res" class="gsearch-res" hidden></div>
+        </div>
+        <span id="syncPill" class="sync-pill" title="Data refreshes periodically (not instantly)"><i class="dot"></i><span id="syncText">Loading…</span></span>
+        <button class="btn primary sm hide-m" data-act="quick-add"><i data-lucide="plus"></i> Quick Add</button>
+        <button class="icon-btn" data-act="theme" aria-label="Toggle theme"><i data-lucide="sun"></i></button>
+        <button class="icon-btn bell" data-act="bell" aria-label="Notifications"><i data-lucide="bell"></i><span id="bellBadge" class="badge-n" hidden>0</span></button>
+        <button class="avatar" data-act="profile" id="avatar" aria-label="Profile">M</button>
+      </header>
+
+      <main id="content" class="content">
+        <section class="page" id="page-dashboard" hidden></section>
+        <section class="page" id="page-library" hidden></section>
+        <section class="page" id="page-data" hidden></section>
+        <section class="page" id="page-analytics" hidden></section>
+        <section class="page" id="page-tasks" hidden></section>
+        <section class="page" id="page-notes" hidden></section>
+        <section class="page" id="page-admin" hidden></section>
+        <section class="page" id="page-settings" hidden></section>
+      </main>
+    </div>
+
+    <nav class="bottomnav" id="bottomNav">
+      <a href="#" data-act="nav" data-page="dashboard"><i data-lucide="layout-dashboard"></i><span>Home</span></a>
+      <a href="#" data-act="nav" data-page="library"><i data-lucide="file-spreadsheet"></i><span>Sheets</span></a>
+      <a href="#" data-act="nav" data-page="data"><i data-lucide="database"></i><span>Data</span></a>
+      <a href="#" data-act="nav" data-page="tasks"><i data-lucide="check-square"></i><span>Tasks</span></a>
+      <a href="#" data-act="more"><i data-lucide="layout-grid"></i><span>More</span></a>
+    </nav>
+  </div>
+
+  <button class="fab" data-act="quick-add" aria-label="Quick add"><i data-lucide="plus"></i></button>
+  <datalist id="dl-cat"></datalist>
+  <div id="modal-root"></div>
+  <div id="toasts" aria-live="polite"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
+  <?!= include_('Scripts') ?>
+</body>
+</html>

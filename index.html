@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>MasterSheet</title>
+<meta name="theme-color" content="#6366F1">
+<meta name="robots" content="noindex,nofollow">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="MasterSheet">
+<style>
+  :root{--bg:#0B1220;--card:#111C30;--bd:#1F2D48;--tx:#F8FAFC;--mu:#94A3B8;--ac:#6366F1}
+  @media (prefers-color-scheme: light){:root{--bg:#F1F5F9;--card:#fff;--bd:#E2E8F0;--tx:#0F172A;--mu:#64748B}}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:grid;place-items:center;padding:16px;background:var(--bg);color:var(--tx);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  .card{width:100%;max-width:440px;background:var(--card);border:1px solid var(--bd);border-radius:20px;padding:28px 24px;text-align:center}
+  img.logo{width:84px;height:84px;border-radius:20px}
+  h1{margin:14px 0 4px;font-size:24px}
+  p{color:var(--mu);margin:0 0 18px}
+  .btn{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:13px 16px;border-radius:12px;border:1px solid var(--bd);background:transparent;color:var(--tx);font:inherit;font-weight:650;cursor:pointer;margin-top:10px;text-decoration:none}
+  .btn.primary{background:var(--ac);border-color:var(--ac);color:#fff}
+  .btn[hidden]{display:none}
+  input{width:100%;padding:12px;border-radius:10px;border:1px solid var(--bd);background:transparent;color:var(--tx);font:inherit;margin-top:6px}
+  small{display:block;color:var(--mu);margin-top:16px;font-size:12.5px;text-align:left}
+  .err{color:#EF4444;min-height:20px;font-size:13px;margin-top:6px;text-align:left}
+  .linkish{background:none;border:0;color:var(--mu);text-decoration:underline;cursor:pointer;margin-top:14px;font:inherit;font-size:13px}
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <img class="logo" src="icons/icon-192.png" alt="MasterSheet">
+  <h1>MasterSheet</h1>
+  <p id="sub">Your Google Sheets-powered dashboard</p>
+
+  <div id="setup" hidden>
+    <label for="url" style="display:block;text-align:left;font-weight:650">Your Apps Script web app URL</label>
+    <input id="url" type="url" inputmode="url" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off">
+    <div class="err" id="err" role="alert"></div>
+    <button class="btn primary" id="save">Save &amp; continue</button>
+  </div>
+
+  <div id="main" hidden>
+    <a class="btn primary" id="open" href="#">Open MasterSheet</a>
+    <button class="btn" id="install" hidden>Install app on this device</button>
+    <button class="btn" id="iosHelp" hidden>How to install on iPhone / iPad</button>
+    <button class="linkish" id="change">Change app URL</button>
+  </div>
+  <small id="note">Sign in with your own Google account. MasterSheet is private and only opens for its owner. This page only stores the app link on this device; your data is never stored here.</small>
+</div>
+
+<script src="config.js"></script>
+<script>
+(function () {
+  var KEY = 'mastersheet-url';
+  var $ = function (id) { return document.getElementById(id); };
+  var standalone = (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || window.navigator.standalone === true;
+  function get() { try { return window.MASTERSHEET_URL || localStorage.getItem(KEY) || ''; } catch (e) { return window.MASTERSHEET_URL || ''; } }
+  function valid(u) { return /^https:\/\/script\.google\.com\/(a\/macros\/[^\/]+\/|macros\/)s\/[A-Za-z0-9_-]+\/(exec|dev)(\?.*)?$/.test(u) || /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(u); }
+
+  function show() {
+    var u = get();
+    $('setup').hidden = !!u; $('main').hidden = !u;
+    if (u) {
+      $('open').href = u;
+      if (standalone && sessionStorage.getItem('ms-auto') !== '1') {          // installed app: jump straight into the dashboard
+        try { sessionStorage.setItem('ms-auto', '1'); } catch (e) {}
+        $('sub').textContent = 'Opening…'; location.replace(u);
+      }
+    }
+  }
+  $('save').onclick = function () {
+    var v = $('url').value.trim();
+    if (!valid(v)) { $('err').textContent = 'Paste the full web app URL from Deploy → Manage deployments (it starts with https://script.google.com/ and ends with /exec).'; return; }
+    try { localStorage.setItem(KEY, v); } catch (e) {}
+    $('err').textContent = ''; show();
+  };
+  $('change').onclick = function () { try { localStorage.removeItem(KEY); } catch (e) {} window.MASTERSHEET_URL = ''; $('url').value = ''; show(); };
+
+  var deferred = null;
+  window.addEventListener('beforeinstallprompt', function (e) { e.preventDefault(); deferred = e; $('install').hidden = false; });
+  $('install').onclick = function () { if (!deferred) return; deferred.prompt(); deferred.userChoice.finally(function () { deferred = null; $('install').hidden = true; }); };
+  window.addEventListener('appinstalled', function () { $('install').hidden = true; });
+  var ios = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (ios && !standalone) { $('iosHelp').hidden = false; $('iosHelp').onclick = function () { alert('In Safari: tap the Share button, then "Add to Home Screen".'); }; }
+
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(function () {});
+  show();
+})();
+</script>
+</body>
+</html>
